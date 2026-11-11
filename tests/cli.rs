@@ -31,6 +31,15 @@ fn a_bad_connection_string_exits_with_an_error() {
     assert!(String::from_utf8_lossy(&ru.stderr).starts_with("DA-E018 эталонная база: DA-E009 неверная строка подключения: "));
 }
 
+/// --version: the crate's, which the packages that ship this binary (sge's, YT Cluster's) check
+/// (0.4.1, 2026-11-11)
+#[test]
+fn the_version_is_the_crates() {
+    let out = bin().arg("--version").output().unwrap();
+    assert!(out.status.success(), "{:?}", out);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("data-diff {}", env!("CARGO_PKG_VERSION")));
+}
+
 #[test]
 fn the_help_lists_every_option() {
     let out = bin().arg("--help").output().unwrap();

@@ -11,9 +11,10 @@ use std::sync::Arc;
 use clap::{ArgAction, Command, CommandFactory, FromArgMatches, Parser};
 use diff_data::i18n::message;
 
-/// CLI struct — help text is injected dynamically via `apply_i18n()`.
+/// CLI struct - help text is injected dynamically via `apply_i18n()`. `--version` is the crate's, as a
+/// package check reads it (0.4.1, 2026-11-11)
 #[derive(Parser, Debug)]
-#[command(name = "data-diff")]
+#[command(name = "data-diff", version)]
 struct Cli {
     #[arg(short = 'r', long = "reference-url")]
     reference_url: String,

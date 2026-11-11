@@ -1,6 +1,6 @@
 [package]
 name = "diff_data"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "DBinvent <support@dbinvent.com>"]
 homepage = "https://vkrinitsyn.github.io/"
@@ -41,4 +41,6 @@ tracing = "0.1"
 uuid = "1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# [yaml] the checksum files (checksum.rs). Not serde_yaml: deprecated, and its unsafe-libyaml is
+# unmaintained (RUSTSEC-2024-0449); serde-saphyr has no unsafe code, as sge has it (0.4.1, 2026-11-11)
+serde-saphyr = "^2.0"
