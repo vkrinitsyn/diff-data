@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -156,16 +158,16 @@ fn apply_i18n() -> Command {
 }
 
 /// Parse table pair strings ("ref:target" or "table") into `TablePair` values.
-fn parse_table_pairs(raw: &[String]) -> Result<Vec<diff_data_rs::TablePair>, String> {
+fn parse_table_pairs(raw: &[String]) -> Result<Vec<diff_data::TablePair>, String> {
     raw.iter()
         .map(|s| {
             if let Some((r, t)) = s.split_once(':') {
-                Ok(diff_data_rs::TablePair {
+                Ok(diff_data::TablePair {
                     reference: r.to_string(),
                     target: t.to_string(),
                 })
             } else {
-                Ok(diff_data_rs::TablePair {
+                Ok(diff_data::TablePair {
                     reference: s.clone(),
                     target: s.clone(),
                 })
@@ -188,8 +190,8 @@ fn parse_alternate_keys(raw: &[String]) -> Result<HashMap<String, Vec<String>>, 
 }
 
 /// Format and print a progress event to stderr.
-fn print_progress(event: &diff_data_rs::config::ProgressEvent) {
-    use diff_data_rs::config::ProgressEvent::*;
+fn print_progress(event: &diff_data::config::ProgressEvent) {
+    use diff_data::config::ProgressEvent::*;
     let msg = match event {
         TableStart { table, table_index, total_tables } => {
             t!("progress.table_start",
@@ -250,7 +252,7 @@ fn print_progress(event: &diff_data_rs::config::ProgressEvent) {
 }
 
 /// Print the diff report to stderr.
-fn print_report(report: &diff_data_rs::DiffReport) {
+fn print_report(report: &diff_data::DiffReport) {
     eprintln!("{}", t!("report.header"));
 
     if report.tables.is_empty() {
@@ -289,10 +291,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Create connection pools
-    let reference_pool = diff_data_rs::create_pool(&cli.reference_url).await.map_err(|e| {
+    let reference_pool = diff_data::create_pool(&cli.reference_url).await.map_err(|e| {
         t!("error.connection_failed", which = "reference", error = e.to_string()).to_string()
     })?;
-    let target_pool = diff_data_rs::create_pool(&cli.target_url).await.map_err(|e| {
+    let target_pool = diff_data::create_pool(&cli.target_url).await.map_err(|e| {
         t!("error.connection_failed", which = "target", error = e.to_string()).to_string()
     })?;
 
@@ -318,14 +320,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let show_progress = !cli.no_progress;
 
     // Build the progress callback
-    let on_progress: Option<Arc<dyn Fn(diff_data_rs::config::ProgressEvent) + Send + Sync>> =
+    let on_progress: Option<Arc<dyn Fn(diff_data::config::ProgressEvent) + Send + Sync>> =
         if show_progress {
             Some(Arc::new(|event| print_progress(&event)))
         } else {
             None
         };
 
-    let config = diff_data_rs::DiffConfig {
+    let config = diff_data::DiffConfig {
         reference_pool,
         target_pool,
         tables,
@@ -359,7 +361,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         checksum_only: cli.checksum_only,
     };
 
-    let report = diff_data_rs::run_diff(config).await?;
+    let report = diff_data::run_diff(config).await?;
     print_report(&report);
 
     Ok(())

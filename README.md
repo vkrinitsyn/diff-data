@@ -1,4 +1,11 @@
 # data-diff
+
+[![crates.io](https://img.shields.io/crates/v/diff_data.svg)](https://crates.io/crates/diff_data)
+[![audit](https://github.com/vkrinitsyn/diff-data/actions/workflows/audit.yml/badge.svg)](https://github.com/vkrinitsyn/diff-data/actions/workflows/audit.yml)
+[![trivy](https://github.com/vkrinitsyn/diff-data/actions/workflows/trivy.yml/badge.svg)](https://github.com/vkrinitsyn/diff-data/actions/workflows/trivy.yml)
+[![coverage](https://raw.githubusercontent.com/vkrinitsyn/diff-data/badges/coverage.svg?sanitize=true)](https://github.com/vkrinitsyn/diff-data/actions/workflows/coverage.yml)
+[![license](https://img.shields.io/github/license/vkrinitsyn/diff-data.svg)](LICENSE)
+
 PostgreSQL DB data diff compare
 
 ## Identify schema diff:
@@ -34,3 +41,25 @@ remove ignore_missing_target
  - Also there is a feature for checksum calculation only and a feature for generating sql based on provided calculated md5 from previous step.
  - if specific flag set then md5 checksum of calculated chunks with a strategies will send into another output format ot use to compare one db with another. 
  - This allow to do md5 calculation for two db separately in background, then compare result and proceed with generating sql content. 
+
+## Compare across a cluster (`cluster`)
+
+The rest of this crate compares two databases, a reference and a target. `diff_data::cluster` compares
+one table across N copies - the nodes of a cluster - as YT Cluster does it (2026-11-11):
+
+- `cluster::recon` - YT Cluster's background reconciliation (ytserv), the reference side: a row's id (its
+  key columns as text joined by `|`), the value a row is compared by (`to_jsonb(t.*)` less the ignored
+  columns), a row's 32-bit checksum, frames of rows folded as `(count, xor32, sum64)` over an integer key,
+  and the vote on a row's copies - unanimous, a strict majority, or on a table its writer commits alone
+  the copy of the node that wrote the row last; else the row is blocked.
+- `cluster::diff` - a node made the same as a primary (YT Cluster's ytctl), on recon's id, value and fold:
+  phase 1 folds the whole table on every node; phase 2 keys each node's rows, plans upserts of the
+  primary's rows that differ or are missing and deletes of the node's rows the primary lacks, and writes
+  one SQL file per node. A table over 1M rows is folded by key range, a differing range halved until it
+  is small, a one-key range paged by its second key column. Two rows of one id refuse the table.
+- `cluster::placement` - which nodes of a YT Cluster hold a table (its `yt_info('P')` row), and why a
+  table cannot be repaired from one primary (sharded, held by zone, another database).
+
+The SQL builders and the vote are pure; the reads take a `tokio_postgres::Client`. The live test runs
+against a PostgreSQL of your own: `DIFF_DATA_PG="host=127.0.0.1 port=5432 user=postgres" cargo test
+--test cluster_live` (it creates and drops `dd_cluster_primary` and `dd_cluster_node`).

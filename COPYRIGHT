@@ -1,0 +1,7 @@
+data-diff (diff_data) - PostgreSQL DB data diff compare: a reference and a target, or
+one table across the nodes of a cluster.
+
+Copyright (c) 2026 Vladimir Krinitsyn, DBinvent
+
+Licensed under the MIT license: see LICENSE. The libraries it is built with are pinned in
+Cargo.lock; `cargo metadata --format-version 1` gives each one's license.

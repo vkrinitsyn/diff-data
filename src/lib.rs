@@ -1,5 +1,10 @@
+//! diff_data (data-diff): no unsafe code - the compiler holds it to that
+#![forbid(unsafe_code)]
+
 pub mod checksum;
 pub mod chunk_strategy;
+/// N copies of a table across a cluster: YT Cluster's compares (ytserv's recon first, ytctl's data diff second)
+pub mod cluster;
 pub mod config;
 pub mod data_diff;
 pub mod delete_sync;

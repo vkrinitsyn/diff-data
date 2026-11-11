@@ -1,15 +1,18 @@
 [package]
-name = "diff_data_rs"
-version = "0.2.2"
+name = "diff_data"
+version = "0.3.2"
 edition = "2024"
-authors = ["Vlad Krinitsyn<v.krinitsyn@gmail.com>"]
+authors = ["Vladimir Krinitsyn <v.krinitsyn@gmail.com>", "DBinvent <support@dbinvent.com>"]
+homepage = "https://vkrinitsyn.github.io/"
+keywords = ["diff", "patch"]
+documentation = "https://github.com/vkrinitsyn/data-diff"
 description = "DB data compare by md5 rows"
 license = "MIT"
 repository = "https://github.com/vkrinitsyn/data-diff"
 
 
 [[bin]]
-name = "data-diff"
+name = "diff_data"
 path = "src/main.rs"
 
 [dependencies]
@@ -26,7 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 uuid = "1"
 serde_json = "1"
-schema_guard_tokio = "1.9"
+schema_guard_tokio = "2.3"
 diff_doc = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"

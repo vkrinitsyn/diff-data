@@ -1,0 +1,74 @@
+name: trivy
+
+# Trivy: known vulnerabilities, secrets and misconfigurations in the repository -
+# Cargo.lock's crates, committed secrets, config files. (sge's trivy.yml scans its
+# Docker image too; diff_data has none.)
+# The findings go to Code scanning (the Security tab), then the run fails on a HIGH
+# or CRITICAL one that has a fix. A finding to accept goes in .trivyignore.
+# A CycloneDX SBOM of what it scanned is kept as the run's artifact (sbom-fs).
+# On a push and a pull request (Dependabot's among them), and weekly: an advisory
+# can come out with nothing changed here.
+on:
+  push:
+    branches-ignore: ["dependabot/**"]   # their pull request runs it
+  pull_request:
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: trivy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fs:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # the SARIF upload
+    steps:
+      - uses: actions/checkout@v7
+      # pinned to a commit, not a tag: trivy-action's tags were force-pushed to
+      # malicious code in March 2026. Dependabot bumps the pin.
+      - name: scan, all findings to SARIF
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: sarif
+          output: trivy-fs.sarif
+          trivyignores: .trivyignore
+      - uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+      - name: gate, HIGH and CRITICAL with a fix
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          trivyignores: .trivyignore
+          skip-setup-trivy: true
+      - name: SBOM, CycloneDX
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: cyclonedx
+          output: sbom-fs.cdx.json
+          skip-setup-trivy: true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: sbom-fs
+          path: sbom-fs.cdx.json

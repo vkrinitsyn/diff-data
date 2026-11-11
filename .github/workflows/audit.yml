@@ -1,0 +1,54 @@
+name: "audit&geiger"   # the badge's label, as sge's
+
+# cargo audit: known vulnerabilities (RustSec) in the dependencies. cargo geiger:
+# unsafe code in diff_data and in each crate it uses, on the run's summary page.
+# On a push and a pull request (Dependabot's among them), and weekly: an advisory
+# can come out with nothing changed here.
+on:
+  push:
+    branches-ignore: ["dependabot/**"]   # their pull request runs it
+  pull_request:
+  schedule:
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # the committed Cargo.lock: first that it is still Cargo.toml's - a --locked build
+      # would refuse one that is not - then its crates
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+      - run: cargo audit
+      # and what a build resolving today would get, as a warning: an advisory with a fix
+      # released that the lock has not taken yet - cargo update takes it
+      - name: cargo audit, freshly resolved (warning only)
+        continue-on-error: true
+        run: |
+          cargo generate-lockfile
+          cargo audit
+
+  geiger:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-geiger
+      # a report, not a gate: the counts go to the log and the summary page. cargo geiger
+      # exits 1 on its "never scanned" warnings; the step's default shell (bash -e, no
+      # pipefail) takes tee's status
+      - run: cargo geiger --output-format GitHubMarkdown | tee -a "$GITHUB_STEP_SUMMARY"

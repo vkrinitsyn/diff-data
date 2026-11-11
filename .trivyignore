@@ -1,0 +1,2 @@
+# Trivy findings accepted, one ID per line (CVE-..., a secret or misconfig rule ID),
+# each with a comment: why, and until when. .github/workflows/trivy.yml reads it.
