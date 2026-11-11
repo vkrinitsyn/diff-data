@@ -1,39 +1,41 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio_postgres::Client;
 use tracing::{debug, info, warn};
 
-use crate::checksum::{self, TableDiffSummary, compare_checksums, load_checksums, save_checksums};
-use crate::config::{DiffConfig, ProgressEvent, parse_table_name};
+use crate::checksum::{self, compare_checksums, load_checksums, save_checksums};
+use crate::config::{DiffConfig, ProgressEvent, TablePair, parse_table_name};
 use crate::delete_sync::TableDeleteSync;
 use crate::error::{DataDiffError, Result};
 use crate::estimation::analyze_and_estimate;
-use crate::metadata::{get_columns, resolve_pk_columns};
-use crate::schema_compare::compare_all_schemas;
+use crate::metadata::{FkDependency, get_columns, get_fk_dependencies, list_tables, resolve_pk_columns, sort_for_insert};
 use crate::table_diff::TableDataDiff;
-use crate::types::{
-    ColumnInfo, DiffReport, SchemaComparisonResult, TableAnalysis, TableDiffReport,
-};
+use crate::types::{ColumnInfo, DiffReport, TableAnalysis, TableDiffReport};
 
-/// Top-level orchestrator for comparing data between two PostgreSQL databases.
+/// Top-level orchestrator for comparing the data of two PostgreSQL databases - the data only: their schemas
+/// are sge's to compare (a comprehensive diff, schema and data, is sge's).
 ///
-/// Runs in 4 phases:
-/// 1. **Schema Comparison** - Compare table schemas, filter out incompatible tables
-/// 2. **Analysis & ETC** - Determine chunk strategies and estimate time to completion
-/// 3. **Per-Table Diff** - Generate INSERT/UPDATE/DELETE scripts
-/// 4. **Master Script** - Write the master SQL script
+/// 1. **Tables** - the configured pairs, else every table of `reference_schema`; with `check_dependencies`,
+///    parents before children by their foreign keys
+/// 2. **Analysis & ETC** - each table's chunk strategy and the estimated time to completion
+/// 3. **Per-table diff** - INSERT/UPDATE SQL, and DELETE SQL with `include_delete`
+/// 4. **Output** - a file per table and kind and the master script that includes them; or one stream
+///    (`output_stream`, or `output_file` with `single_file`): the INSERTs and UPDATEs, then the DELETEs
 pub struct DataDiff {
     config: DiffConfig,
     cancelled: bool,
 }
 
+/// A table's columns and its key on one side, the checksums' input
+type ChecksumTable = (String, Vec<ColumnInfo>, Vec<ColumnInfo>);
+
 impl DataDiff {
     pub fn new(config: DiffConfig) -> Self {
-        Self {
-            config,
-            cancelled: false,
-        }
+        Self { config, cancelled: false }
     }
 
     pub fn cancel(&mut self) {
@@ -50,90 +52,41 @@ impl DataDiff {
         if self.config.checksum_only {
             return self.run_compute_checksums().await;
         }
-        if self.config.reference_checksum_file.is_some()
-            && self.config.target_checksum_file.is_some()
-        {
+        if self.config.reference_checksum_file.is_some() && self.config.target_checksum_file.is_some() {
             return self.run_from_checksums().await;
         }
-        self.run_default().await
+        self.diff(None).await
     }
 
-    /// Compute MD5 checksums for both reference and target databases and save to YAML.
-    ///
-    /// This is the "checksum calculation only" mode. It:
-    /// 1. Connects to both databases
-    /// 2. Runs schema comparison and analysis to determine chunk strategies
-    /// 3. Computes MD5 checksums for every row in every table
-    /// 4. Saves checksum manifests to the configured paths
-    /// 5. Returns a summary report (no SQL files generated)
+    /// Compute MD5 checksums of every row of every table, each side's, and save them to YAML: no SQL.
+    /// A table without a key has no checksums on that side - a warning says so.
     ///
     /// Requires `save_reference_checksums` and/or `save_target_checksums` to be set.
     pub async fn run_compute_checksums(&mut self) -> Result<DiffReport> {
-        if self.config.save_reference_checksums.is_none()
-            && self.config.save_target_checksums.is_none()
-        {
-            return Err(DataDiffError::Config(
-                "checksum_only mode requires at least one of save_reference_checksums \
-                 or save_target_checksums to be set"
-                    .to_string(),
-            ));
+        if self.config.save_reference_checksums.is_none() && self.config.save_target_checksums.is_none() {
+            return Err(DataDiffError::Config(tr!("error.checksum_only_no_file")));
         }
 
         let ref_conn = self.config.reference_pool.get().await?;
         let target_conn = self.config.target_pool.get().await?;
-
         let mut report = DiffReport::default();
 
-        // ---------------------------------------------------------------
-        // Phase 1: Schema Comparison
-        // ---------------------------------------------------------------
-        let (active_tables, schema_warnings) = self.run_schema_comparison().await?;
-        report.warnings.extend(schema_warnings);
+        let tables = self.tables(&ref_conn).await?;
+        let analyses = analyze_and_estimate(&ref_conn, &target_conn, &tables, &self.config).await?;
 
-        // ---------------------------------------------------------------
-        // Phase 2: Analysis & ETC Estimation
-        // ---------------------------------------------------------------
-        let analyses = analyze_and_estimate(
-            &ref_conn,
-            &target_conn,
-            &active_tables,
-            &self.config,
-        )
-        .await?;
-
-        // ---------------------------------------------------------------
-        // Phase 3: Compute Checksums
-        // ---------------------------------------------------------------
-
-        // Build table info for ref
-        if self.config.save_reference_checksums.is_some() {
-            let mut ref_table_info: Vec<(String, Vec<ColumnInfo>, Vec<ColumnInfo>)> = Vec::new();
-            for pair in &active_tables {
-                let ref_columns = get_columns(&ref_conn, &pair.reference).await?;
-                let (pk_cols, _) = resolve_pk_columns(
-                    &ref_columns,
-                    self.config
-                        .alternate_keys
-                        .get(&pair.reference)
-                        .map(|v| v.as_slice()),
-                );
-                ref_table_info.push((pair.reference.clone(), ref_columns, pk_cols));
-            }
-
-            let ref_manifest = checksum::compute_db_checksums(
+        if let Some(path) = self.config.save_reference_checksums.clone() {
+            let info = self.checksum_tables(&ref_conn, &tables, true, &mut report.warnings).await?;
+            let manifest = checksum::compute_db_checksums(
                 &ref_conn,
-                &ref_table_info,
+                &info,
                 &analyses,
                 self.config.reference_db_name.as_deref(),
                 self.config.reference_schema.as_deref(),
             )
             .await?;
-
-            let path = self.config.save_reference_checksums.as_ref().unwrap();
-            save_checksums(&ref_manifest, path)?;
+            save_checksums(&manifest, &path)?;
             info!("Saved reference checksums to {}", path.display());
-
-            for tc in &ref_manifest.tables {
+            for tc in &manifest.tables {
                 let total_hashes: usize = tc.chunks.iter().map(|c| c.row_hashes.len()).sum();
                 report.tables.push(TableDiffReport {
                     table_name: tc.table_name.clone(),
@@ -143,98 +96,57 @@ impl DataDiff {
             }
         }
 
-        // Build table info for target
-        if self.config.save_target_checksums.is_some() {
-            let mut target_table_info: Vec<(String, Vec<ColumnInfo>, Vec<ColumnInfo>)> = Vec::new();
-            for pair in &active_tables {
-                let target_columns = get_columns(&target_conn, &pair.target).await?;
-                let (pk_cols, _) = resolve_pk_columns(
-                    &target_columns,
-                    self.config
-                        .alternate_keys
-                        .get(&pair.target)
-                        .map(|v| v.as_slice()),
-                );
-                target_table_info.push((pair.target.clone(), target_columns, pk_cols));
-            }
-
+        if let Some(path) = self.config.save_target_checksums.clone() {
+            let info = self.checksum_tables(&target_conn, &tables, false, &mut report.warnings).await?;
+            // each table's strategy is the reference's: the chunks of the two sides line up
             let target_analyses: Vec<TableAnalysis> = analyses
                 .iter()
-                .map(|a| TableAnalysis {
-                    ref_table: a.target_table.clone(),
-                    target_table: a.target_table.clone(),
-                    row_count: a.row_count,
-                    timestamp_column: a.timestamp_column.clone(),
-                    strategy: a.strategy.clone(),
-                    estimated_seconds: a.estimated_seconds,
-                })
+                .map(|a| TableAnalysis { ref_table: a.target_table.clone(), ..a.clone() })
                 .collect();
-
-            let target_manifest = checksum::compute_db_checksums(
+            let manifest = checksum::compute_db_checksums(
                 &target_conn,
-                &target_table_info,
+                &info,
                 &target_analyses,
                 self.config.target_db_name.as_deref(),
                 self.config.target_schema.as_deref(),
             )
             .await?;
-
-            let path = self.config.save_target_checksums.as_ref().unwrap();
-            save_checksums(&target_manifest, path)?;
+            save_checksums(&manifest, &path)?;
             info!("Saved target checksums to {}", path.display());
         }
 
         Ok(report)
     }
 
-    /// Generate SQL from pre-computed checksum files.
-    ///
-    /// This is the "SQL from checksums" mode. It:
-    /// 1. Loads reference and target checksum manifests from YAML files
-    /// 2. Compares them to identify tables/chunks with differences
-    /// 3. Connects to both databases
-    /// 4. For differing tables only, runs the standard row-by-row comparison to generate SQL
-    /// 5. Skips tables where checksums match (significant speedup for large DBs)
+    /// Generate SQL from pre-computed checksum files: for the tables whose checksums differ only, each
+    /// compared and written as the default run writes it.
     ///
     /// Requires both `reference_checksum_file` and `target_checksum_file` to be set.
     pub async fn run_from_checksums(&mut self) -> Result<DiffReport> {
-        let ref_checksum_path = self.config.reference_checksum_file.as_ref().ok_or_else(|| {
-            DataDiffError::Config("reference_checksum_file is required for run_from_checksums".to_string())
-        })?;
-        let target_checksum_path = self.config.target_checksum_file.as_ref().ok_or_else(|| {
-            DataDiffError::Config("target_checksum_file is required for run_from_checksums".to_string())
-        })?;
+        let ref_checksum_path = self
+            .config
+            .reference_checksum_file
+            .as_ref()
+            .ok_or_else(|| DataDiffError::Config(tr!("error.no_reference_checksums")))?;
+        let target_checksum_path = self
+            .config
+            .target_checksum_file
+            .as_ref()
+            .ok_or_else(|| DataDiffError::Config(tr!("error.no_target_checksums")))?;
 
-        // Load pre-computed checksums
         let ref_manifest = load_checksums(ref_checksum_path)?;
         let target_manifest = load_checksums(target_checksum_path)?;
-
         info!(
             "Loaded checksums: ref={} tables, target={} tables",
             ref_manifest.tables.len(),
             target_manifest.tables.len()
         );
 
-        // Compare checksums to find differing tables
         let diff_summaries = compare_checksums(&ref_manifest, &target_manifest);
-
-        info!(
-            "Checksum comparison: {} tables with differences",
-            diff_summaries.len()
-        );
-
         if diff_summaries.is_empty() {
             info!("All checksums match - no SQL to generate");
             return Ok(DiffReport::default());
         }
-
-        // Build set of table names that have differences
-        let diff_table_names: HashMap<&str, &TableDiffSummary> = diff_summaries
-            .iter()
-            .map(|s| (s.table_name.as_str(), s))
-            .collect();
-
-        // Log what we found
         for summary in &diff_summaries {
             info!(
                 "Table '{}': {} differing chunks, {} missing in target, {} missing in ref, {} modified",
@@ -245,811 +157,586 @@ impl DataDiff {
                 summary.modified.len(),
             );
         }
+        let differing: HashSet<String> = diff_summaries.into_iter().map(|s| s.table_name).collect();
+        self.diff(Some(&differing)).await
+    }
 
-        // Now connect to DBs and generate SQL only for differing tables
-        if self.config.output_stream.is_none() {
-            fs::create_dir_all(&self.config.output_dir)?;
-        }
-
+    /// The diff of the tables - of those named in `only`, when given (by their names without schema)
+    async fn diff(&mut self, only: Option<&HashSet<String>>) -> Result<DiffReport> {
         let ref_conn = self.config.reference_pool.get().await?;
         let target_conn = self.config.target_pool.get().await?;
 
+        let mut tables = self.tables(&ref_conn).await?;
+        if let Some(only) = only {
+            tables.retain(|p| {
+                let differs = only.contains(parse_table_name(&p.target).1) || only.contains(parse_table_name(&p.reference).1);
+                if !differs {
+                    debug!("Skipping table {} - checksums match", p.target);
+                }
+                differs
+            });
+        }
+
+        let analyses = analyze_and_estimate(&ref_conn, &target_conn, &tables, &self.config).await?;
+        let analysis_map: HashMap<String, TableAnalysis> = analyses.into_iter().map(|a| (a.ref_table.clone(), a)).collect();
+        let tables = self.in_dependency_order(&ref_conn, tables).await?;
+
+        let mut out = Output::open(&self.config)?;
         let mut report = DiffReport::default();
-
-        // Schema comparison (to filter out incompatible tables)
-        let (active_tables, schema_warnings) = self.run_schema_comparison().await?;
-        report.warnings.extend(schema_warnings);
-
-        // Analysis for differing tables only
-        let analyses = analyze_and_estimate(
-            &ref_conn,
-            &target_conn,
-            &active_tables,
-            &self.config,
-        )
-        .await?;
-
-        let analysis_map: HashMap<String, TableAnalysis> = analyses
-            .into_iter()
-            .map(|a| (a.ref_table.clone(), a))
-            .collect();
-
-        let use_stream = self.config.output_stream.is_some();
-
-        for (table_idx, table_pair) in active_tables.iter().enumerate() {
+        for (table_idx, pair) in tables.iter().enumerate() {
             if self.cancelled {
                 return Err(DataDiffError::Cancelled);
             }
+            let analysis = analysis_map.get(&pair.reference).cloned();
+            let table_report = self
+                .diff_table(&ref_conn, &target_conn, pair, (table_idx, tables.len()), analysis, &mut out, &mut report.warnings)
+                .await?;
+            report.tables.push(table_report);
+        }
+        out.finish(&self.config, &mut report)?;
+        Ok(report)
+    }
 
-            let (_, ref_tname) = parse_table_name(&table_pair.reference);
-            let (_, target_tname) = parse_table_name(&table_pair.target);
+    /// One table pair compared, its SQL to `out`. A table that cannot be compared (missing, no key, the
+    /// target short of a reference column) is a warning, and the run goes on.
+    #[allow(clippy::too_many_arguments)]
+    async fn diff_table(
+        &self,
+        ref_conn: &Client,
+        target_conn: &Client,
+        pair: &TablePair,
+        (table_index, total_tables): (usize, usize),
+        analysis: Option<TableAnalysis>,
+        out: &mut Output,
+        warnings: &mut Vec<String>,
+    ) -> Result<TableDiffReport> {
+        let (_, ref_tname) = parse_table_name(&pair.reference);
+        let (_, target_tname) = parse_table_name(&pair.target);
+        self.config.emit_progress(ProgressEvent::TableStart {
+            table: target_tname.to_string(),
+            table_index,
+            total_tables,
+        });
+        info!("Comparing table: {} -> {}", ref_tname, target_tname);
 
-            // Skip tables with no checksum differences
-            if !diff_table_names.contains_key(target_tname)
-                && !diff_table_names.contains_key(ref_tname)
-            {
-                debug!("Skipping table {} - checksums match", target_tname);
+        let mut report = TableDiffReport { table_name: target_tname.to_string(), ..Default::default() };
+        let alternate_keys = self.alternate_keys(pair);
+
+        let mut diff = TableDataDiff::new(ref_conn, target_conn, pair.reference.clone(), pair.target.clone());
+        diff.set_chunk_size(self.config.chunk_size);
+        diff.set_columns_to_ignore(self.config.columns_to_ignore.clone());
+        diff.set_alternate_keys(alternate_keys.clone());
+        diff.set_exclude_real_pk(self.config.exclude_real_pk);
+        diff.set_table_where(self.config.table_where.clone());
+        diff.set_include_identity_columns(self.config.include_identity_columns);
+        diff.set_on_progress(self.config.on_progress.clone());
+        diff.set_analysis(analysis);
+        if self.config.exclude_ignored_columns {
+            diff.set_exclude_columns(self.config.columns_to_ignore.clone());
+        }
+
+        let mut sql = out.table(target_tname)?;
+        match diff.execute(&mut sql.insert, &mut sql.update).await {
+            Ok(stats) => {
+                report.inserts = stats.inserts;
+                report.updates = stats.updates;
+                self.config.emit_progress(ProgressEvent::TableDiffComplete {
+                    table: target_tname.to_string(),
+                    inserts: stats.inserts,
+                    updates: stats.updates,
+                });
+            }
+            Err(e) if recoverable(&e) => {
+                let warning = e.to_string();
+                warn!("{}", warning);
+                warnings.push(warning);
+                sql.discard();
+                return Ok(report);
+            }
+            Err(e) => return Err(e),
+        }
+
+        if self.config.include_delete {
+            let mut del_sync = TableDeleteSync::new(target_conn, ref_conn, pair.target.clone(), pair.reference.clone());
+            del_sync.set_chunk_size(self.config.chunk_size);
+            del_sync.set_alternate_keys(alternate_keys);
+            match del_sync.execute(&mut sql.delete).await {
+                Ok(deletes) => {
+                    report.deletes = deletes;
+                    self.config.emit_progress(ProgressEvent::TableDeleteComplete {
+                        table: target_tname.to_string(),
+                        deletes,
+                    });
+                }
+                Err(DataDiffError::NoPrimaryKey(_)) => debug!("Skipping delete sync for {} - no PK", pair.target),
+                Err(e) => return Err(e),
+            }
+        }
+
+        out.done(sql, &mut report)?;
+        Ok(report)
+    }
+
+    /// The table pairs: the configured ones, else every table of `reference_schema`, each in
+    /// `target_schema` (default the same)
+    async fn tables(&self, ref_conn: &Client) -> Result<Vec<TablePair>> {
+        let Some(ref_schema) = self.config.reference_schema.as_deref().filter(|_| self.config.tables.is_empty()) else {
+            return Ok(self.config.tables.clone());
+        };
+        let target_schema = self.config.target_schema.as_deref().unwrap_or(ref_schema);
+        Ok(list_tables(ref_conn, ref_schema)
+            .await?
+            .into_iter()
+            .map(|t| TablePair { reference: format!("{}.{}", ref_schema, t), target: format!("{}.{}", target_schema, t) })
+            .collect())
+    }
+
+    /// With `check_dependencies`, the pairs with each reference table after the tables it references
+    /// (its foreign keys, within its schema), else as given; without, as given
+    async fn in_dependency_order(&self, ref_conn: &Client, tables: Vec<TablePair>) -> Result<Vec<TablePair>> {
+        if !self.config.check_dependencies || tables.len() < 2 {
+            return Ok(tables);
+        }
+        self.config.emit_progress(ProgressEvent::SortingDependencies);
+        let current: String = ref_conn.query_one("SELECT current_schema()", &[]).await?.get(0);
+        let names: Vec<String> = tables
+            .iter()
+            .map(|p| {
+                let (schema, table) = parse_table_name(&p.reference);
+                format!("{}.{}", schema.unwrap_or(&current), table)
+            })
+            .collect();
+        let mut schemas: Vec<&str> = names.iter().map(|n| parse_table_name(n).0.unwrap_or_default()).collect();
+        schemas.sort_unstable();
+        schemas.dedup();
+        let mut deps = Vec::new();
+        for schema in schemas {
+            for d in get_fk_dependencies(ref_conn, schema).await? {
+                deps.push(FkDependency {
+                    table: format!("{}.{}", schema, d.table),
+                    references_table: format!("{}.{}", schema, d.references_table),
+                });
+            }
+        }
+        let order = sort_for_insert(&names, &deps);
+        let rank = |n: &String| order.iter().position(|o| o.eq_ignore_ascii_case(n)).unwrap_or(order.len());
+        let mut ranked: Vec<(usize, TablePair)> = names.iter().map(rank).zip(tables).collect();
+        ranked.sort_by_key(|(r, _)| *r);
+        Ok(ranked.into_iter().map(|(_, p)| p).collect())
+    }
+
+    /// A pair's alternate key: by the target's name, schema-qualified or not, else the reference's
+    fn alternate_keys(&self, pair: &TablePair) -> Option<Vec<String>> {
+        [pair.target.as_str(), parse_table_name(&pair.target).1, pair.reference.as_str(), parse_table_name(&pair.reference).1]
+            .iter()
+            .find_map(|n| self.config.alternate_keys.get(*n))
+            .cloned()
+    }
+
+    /// Each table of one side with its columns and its key; one without a key is left out, with a warning
+    async fn checksum_tables(&self, conn: &Client, tables: &[TablePair], reference: bool, warnings: &mut Vec<String>)
+        -> Result<Vec<ChecksumTable>>
+    {
+        let mut out = Vec::new();
+        for pair in tables {
+            let name = if reference { &pair.reference } else { &pair.target };
+            let columns = get_columns(conn, name).await?;
+            let keys = self.alternate_keys(pair);
+            let (pk_cols, _) = resolve_pk_columns(&columns, keys.as_deref());
+            if pk_cols.is_empty() {
+                warnings.push(if reference {
+                    tr!("error.no_key_reference_checksums", table = name)
+                } else {
+                    tr!("error.no_key_target_checksums", table = name)
+                });
                 continue;
             }
-
-            self.config.emit_progress(ProgressEvent::TableStart {
-                table: target_tname.to_string(),
-                table_index: table_idx,
-                total_tables: active_tables.len(),
-            });
-
-            info!(
-                "Generating SQL for differing table: {} -> {}",
-                ref_tname, target_tname
-            );
-
-            let mut table_report = TableDiffReport {
-                table_name: target_tname.to_string(),
-                ..Default::default()
-            };
-
-            let alternate_keys = self
-                .config
-                .alternate_keys
-                .get(target_tname)
-                .or_else(|| self.config.alternate_keys.get(ref_tname))
-                .cloned();
-
-            let mut diff = TableDataDiff::new(
-                &ref_conn,
-                &target_conn,
-                table_pair.reference.clone(),
-                table_pair.target.clone(),
-            );
-            diff.set_chunk_size(self.config.chunk_size);
-            diff.set_columns_to_ignore(self.config.columns_to_ignore.clone());
-            diff.set_alternate_keys(alternate_keys.clone());
-            diff.set_exclude_real_pk(self.config.exclude_real_pk);
-            diff.set_on_progress(self.config.on_progress.clone());
-
-            let table_analysis = analysis_map.get(&table_pair.reference).cloned();
-            diff.set_analysis(table_analysis);
-
-            if self.config.exclude_ignored_columns {
-                diff.set_exclude_columns(self.config.columns_to_ignore.clone());
-            }
-
-            if use_stream {
-                let stream = self.config.output_stream.as_ref().unwrap();
-                let mut insert_buf: Vec<u8> = Vec::new();
-                let mut update_buf: Vec<u8> = Vec::new();
-
-                match diff.execute(&mut insert_buf, &mut update_buf).await {
-                    Ok(stats) => {
-                        table_report.inserts = stats.inserts;
-                        table_report.updates = stats.updates;
-
-                        let mut locked = stream.lock().map_err(|e| {
-                            DataDiffError::Config(format!("Failed to lock output stream: {}", e))
-                        })?;
-                        if !insert_buf.is_empty() {
-                            locked.write_all(&insert_buf)?;
-                        }
-                        if !update_buf.is_empty() {
-                            locked.write_all(&update_buf)?;
-                        }
-
-                        self.config
-                            .emit_progress(ProgressEvent::TableDiffComplete {
-                                table: target_tname.to_string(),
-                                inserts: stats.inserts,
-                                updates: stats.updates,
-                            });
-                    }
-                    Err(e) => {
-                        if let Some(warning) = diff_error_to_warning(&e) {
-                            warn!("{}", warning);
-                            report.warnings.push(warning);
-                            report.tables.push(table_report);
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                }
-
-                // DELETE phase to stream
-                if self.config.include_delete {
-                    let mut delete_buf: Vec<u8> = Vec::new();
-
-                    let mut del_sync = TableDeleteSync::new(
-                        &target_conn,
-                        &ref_conn,
-                        table_pair.target.clone(),
-                        table_pair.reference.clone(),
-                    );
-                    del_sync.set_chunk_size(self.config.chunk_size);
-                    del_sync.set_alternate_keys(alternate_keys);
-
-                    match del_sync.execute(&mut delete_buf).await {
-                        Ok(deletes) => {
-                            table_report.deletes = deletes;
-                            if !delete_buf.is_empty() {
-                                let mut locked = stream.lock().map_err(|e| {
-                                    DataDiffError::Config(format!(
-                                        "Failed to lock output stream: {}",
-                                        e
-                                    ))
-                                })?;
-                                locked.write_all(&delete_buf)?;
-                            }
-                            self.config
-                                .emit_progress(ProgressEvent::TableDeleteComplete {
-                                    table: target_tname.to_string(),
-                                    deletes,
-                                });
-                        }
-                        Err(DataDiffError::NoPrimaryKey(_)) => {
-                            debug!(
-                                "Skipping delete sync for {} - no PK",
-                                table_pair.target
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            } else {
-                // File mode
-                let insert_filename = format!("{}_$insert.sql", target_tname);
-                let update_filename = format!("{}_$update.sql", target_tname);
-                let insert_path = self.config.output_dir.join(&insert_filename);
-                let update_path = self.config.output_dir.join(&update_filename);
-
-                let mut insert_file = BufWriter::new(File::create(&insert_path)?);
-                let mut update_file = BufWriter::new(File::create(&update_path)?);
-
-                match diff.execute(&mut insert_file, &mut update_file).await {
-                    Ok(stats) => {
-                        table_report.inserts = stats.inserts;
-                        table_report.updates = stats.updates;
-
-                        self.config
-                            .emit_progress(ProgressEvent::TableDiffComplete {
-                                table: target_tname.to_string(),
-                                inserts: stats.inserts,
-                                updates: stats.updates,
-                            });
-                    }
-                    Err(e) => {
-                        if let Some(warning) = diff_error_to_warning(&e) {
-                            warn!("{}", warning);
-                            report.warnings.push(warning);
-                            cleanup_empty(&insert_path);
-                            cleanup_empty(&update_path);
-                            report.tables.push(table_report);
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                }
-
-                drop(insert_file);
-                drop(update_file);
-
-                if file_has_content(&insert_path) {
-                    table_report.insert_file = Some(insert_filename.clone());
-                } else {
-                    cleanup_empty(&insert_path);
-                }
-                if file_has_content(&update_path) {
-                    table_report.update_file = Some(update_filename.clone());
-                } else {
-                    cleanup_empty(&update_path);
-                }
-
-                // DELETE phase
-                if self.config.include_delete {
-                    let delete_filename = format!("{}_$delete.sql", target_tname);
-                    let delete_path = self.config.output_dir.join(&delete_filename);
-                    let mut delete_file = BufWriter::new(File::create(&delete_path)?);
-
-                    let mut del_sync = TableDeleteSync::new(
-                        &target_conn,
-                        &ref_conn,
-                        table_pair.target.clone(),
-                        table_pair.reference.clone(),
-                    );
-                    del_sync.set_chunk_size(self.config.chunk_size);
-                    del_sync.set_alternate_keys(alternate_keys);
-
-                    match del_sync.execute(&mut delete_file).await {
-                        Ok(deletes) => {
-                            table_report.deletes = deletes;
-                            self.config
-                                .emit_progress(ProgressEvent::TableDeleteComplete {
-                                    table: target_tname.to_string(),
-                                    deletes,
-                                });
-                        }
-                        Err(DataDiffError::NoPrimaryKey(_)) => {
-                            debug!(
-                                "Skipping delete sync for {} - no PK",
-                                table_pair.target
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-
-                    drop(delete_file);
-
-                    if file_has_content(&delete_path) {
-                        table_report.delete_file = Some(delete_filename);
-                    } else {
-                        cleanup_empty(&delete_path);
-                    }
-                }
-            }
-
-            report.tables.push(table_report);
+            out.push((name.clone(), columns, pk_cols));
         }
+        Ok(out)
+    }
+}
 
-        // Master Script (file mode only)
-        if !self.cancelled && !use_stream {
-            self.write_master_script(&report)?;
-            report.master_script = Some(
-                self.config.output_file.to_string_lossy().into_owned(),
-            );
+/// A table that cannot be compared, which a run warns of and goes on past
+fn recoverable(e: &DataDiffError) -> bool {
+    matches!(e, DataDiffError::TableNotFound(_) | DataDiffError::NoPrimaryKey(_) | DataDiffError::ColumnMismatch { .. })
+}
+
+/// The output stream, locked
+fn lock<'a>(out: &'a Mutex<dyn Write + Send + 'static>) -> Result<MutexGuard<'a, dyn Write + Send + 'static>> {
+    out.lock().map_err(|e| DataDiffError::Config(tr!("error.stream_lock", err = e)))
+}
+
+/// Where a run's SQL goes
+enum Output {
+    /// a file per table and kind in `output_dir`, then the master script, `output_file`, that includes them
+    Files { dir: PathBuf },
+    /// one stream: each table's INSERTs and UPDATEs as it is compared, then every DELETE, children first
+    /// with `check_dependencies`; `file` the one file (`single_file`) it is, if one
+    Stream { out: Arc<Mutex<dyn Write + Send>>, deletes: Vec<Vec<u8>>, file: Option<PathBuf> },
+}
+
+/// One table's SQL by kind: its files, or buffers for the stream
+struct TableSql {
+    insert: Part,
+    update: Part,
+    delete: Part,
+}
+
+/// One kind of one table's SQL
+enum Part {
+    File { name: String, path: PathBuf, w: BufWriter<File> },
+    Buf(Vec<u8>),
+}
+
+impl Write for Part {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        match self {
+            Part::File { w, .. } => w.write(b),
+            Part::Buf(v) => v.write(b),
         }
-
-        Ok(report)
     }
 
-    /// Run schema comparison and return active table pairs + warnings.
-    async fn run_schema_comparison(
-        &self,
-    ) -> Result<(Vec<crate::config::TablePair>, Vec<String>)> {
-        let mut schema_results: HashMap<String, SchemaComparisonResult> = HashMap::new();
-        let mut warnings = Vec::new();
-
-        if self.config.reference_db_name.is_some()
-            && self.config.target_db_name.is_some()
-            && self.config.reference_schema.is_some()
-            && self.config.target_schema.is_some()
-        {
-            self.config.emit_progress(ProgressEvent::SchemaCompareStart);
-
-            let results = compare_all_schemas(
-                &self.config.reference_pool,
-                &self.config.target_pool,
-                self.config.reference_db_name.as_deref().unwrap(),
-                self.config.target_db_name.as_deref().unwrap(),
-                self.config.reference_schema.as_deref().unwrap(),
-                self.config.target_schema.as_deref().unwrap(),
-                &self.config.exclude_tables,
-            )
-            .await?;
-
-            for (table_name, result) in &results {
-                let result_str = match result {
-                    SchemaComparisonResult::Match => "Match".to_string(),
-                    SchemaComparisonResult::TargetSuperset { extra_columns } => {
-                        format!("Target superset (extra: {})", extra_columns.join(", "))
-                    }
-                    SchemaComparisonResult::Excluded => "Excluded".to_string(),
-                    SchemaComparisonResult::Mismatch { message } => {
-                        format!("Mismatch: {}", message)
-                    }
-                };
-
-                self.config
-                    .emit_progress(ProgressEvent::SchemaCompareResult {
-                        table: table_name.clone(),
-                        result: result_str,
-                    });
-
-                if let SchemaComparisonResult::Mismatch { message } = result {
-                    warn!(
-                        "Schema mismatch for table '{}': {}. Skipping.",
-                        table_name, message
-                    );
-                    warnings.push(format!(
-                        "Schema mismatch for '{}': {}. Add to exclusion list or define a timestamp column.",
-                        table_name, message
-                    ));
-                }
-            }
-
-            schema_results = results;
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Part::File { w, .. } => w.flush(),
+            Part::Buf(_) => Ok(()),
         }
+    }
+}
 
-        let active_tables: Vec<_> = self
-            .config
-            .tables
-            .iter()
-            .filter(|pair| {
-                let (_, ref_tname) = parse_table_name(&pair.reference);
-                !matches!(
-                    schema_results.get(ref_tname),
-                    Some(SchemaComparisonResult::Mismatch { .. })
-                )
-            })
-            .cloned()
-            .collect();
-
-        Ok((active_tables, warnings))
+impl Part {
+    fn file(dir: &std::path::Path, name: String) -> io::Result<Part> {
+        let path = dir.join(&name);
+        Ok(Part::File { w: BufWriter::new(File::create(&path)?), name, path })
     }
 
-    /// Run the default (original) data diff operation without checksum flow.
-    async fn run_default(&mut self) -> Result<DiffReport> {
-        // Ensure output directory exists (only needed in file mode)
-        if self.config.output_stream.is_none() {
-            fs::create_dir_all(&self.config.output_dir)?;
-        }
-
-        let ref_conn = self.config.reference_pool.get().await?;
-        let target_conn = self.config.target_pool.get().await?;
-
-        let mut report = DiffReport::default();
-
-        // ---------------------------------------------------------------
-        // Phase 1: Schema Comparison
-        // ---------------------------------------------------------------
-        let mut schema_results: HashMap<String, SchemaComparisonResult> = HashMap::new();
-
-        if self.config.reference_db_name.is_some()
-            && self.config.target_db_name.is_some()
-            && self.config.reference_schema.is_some()
-            && self.config.target_schema.is_some()
-        {
-            self.config.emit_progress(ProgressEvent::SchemaCompareStart);
-
-            let results = compare_all_schemas(
-                &self.config.reference_pool,
-                &self.config.target_pool,
-                self.config.reference_db_name.as_deref().unwrap(),
-                self.config.target_db_name.as_deref().unwrap(),
-                self.config.reference_schema.as_deref().unwrap(),
-                self.config.target_schema.as_deref().unwrap(),
-                &self.config.exclude_tables,
-            )
-            .await?;
-
-            for (table_name, result) in &results {
-                let result_str = match result {
-                    SchemaComparisonResult::Match => "Match".to_string(),
-                    SchemaComparisonResult::TargetSuperset { extra_columns } => {
-                        format!("Target superset (extra: {})", extra_columns.join(", "))
-                    }
-                    SchemaComparisonResult::Excluded => "Excluded".to_string(),
-                    SchemaComparisonResult::Mismatch { message } => {
-                        format!("Mismatch: {}", message)
-                    }
-                };
-
-                self.config
-                    .emit_progress(ProgressEvent::SchemaCompareResult {
-                        table: table_name.clone(),
-                        result: result_str,
-                    });
-
-                if let SchemaComparisonResult::Mismatch { message } = result {
-                    warn!(
-                        "Schema mismatch for table '{}': {}. Skipping.",
-                        table_name, message
-                    );
-                    report.warnings.push(format!(
-                        "Schema mismatch for '{}': {}. Add to exclusion list or define a timestamp column.",
-                        table_name, message
-                    ));
-                }
-            }
-
-            schema_results = results;
-        }
-
-        // Filter table pairs: skip tables with schema Mismatch
-        let active_tables: Vec<_> = self
-            .config
-            .tables
-            .iter()
-            .filter(|pair| {
-                let (_, ref_tname) = parse_table_name(&pair.reference);
-                match schema_results.get(ref_tname) {
-                    Some(SchemaComparisonResult::Mismatch { .. }) => false,
-                    _ => true,
-                }
-            })
-            .cloned()
-            .collect();
-
-        // ---------------------------------------------------------------
-        // Phase 2: Analysis & ETC Estimation
-        // ---------------------------------------------------------------
-        let analyses = analyze_and_estimate(
-            &ref_conn,
-            &target_conn,
-            &active_tables,
-            &self.config,
-        )
-        .await?;
-
-        // Build analysis lookup by reference table name
-        let analysis_map: HashMap<String, TableAnalysis> = analyses
-            .into_iter()
-            .map(|a| (a.ref_table.clone(), a))
-            .collect();
-
-        // ---------------------------------------------------------------
-        // Phase 3: Per-Table Diff
-        // ---------------------------------------------------------------
-        let use_stream = self.config.output_stream.is_some();
-
-        for (table_idx, table_pair) in active_tables.iter().enumerate() {
-            if self.cancelled {
-                return Err(DataDiffError::Cancelled);
-            }
-
-            let (_, ref_tname) = parse_table_name(&table_pair.reference);
-            let (_, target_tname) = parse_table_name(&table_pair.target);
-
-            self.config.emit_progress(ProgressEvent::TableStart {
-                table: target_tname.to_string(),
-                table_index: table_idx,
-                total_tables: active_tables.len(),
-            });
-
-            info!("Comparing table: {} -> {}", ref_tname, target_tname);
-
-            let mut table_report = TableDiffReport {
-                table_name: target_tname.to_string(),
-                ..Default::default()
-            };
-
-            let alternate_keys = self
-                .config
-                .alternate_keys
-                .get(target_tname)
-                .or_else(|| self.config.alternate_keys.get(ref_tname))
-                .cloned();
-
-            let mut diff = TableDataDiff::new(
-                &ref_conn,
-                &target_conn,
-                table_pair.reference.clone(),
-                table_pair.target.clone(),
-            );
-            diff.set_chunk_size(self.config.chunk_size);
-            diff.set_columns_to_ignore(self.config.columns_to_ignore.clone());
-            diff.set_alternate_keys(alternate_keys.clone());
-            diff.set_exclude_real_pk(self.config.exclude_real_pk);
-            diff.set_on_progress(self.config.on_progress.clone());
-
-            // Pass analysis to the table diff so it can choose the right strategy
-            let table_analysis = analysis_map.get(&table_pair.reference).cloned();
-            diff.set_analysis(table_analysis);
-
-            if self.config.exclude_ignored_columns {
-                diff.set_exclude_columns(self.config.columns_to_ignore.clone());
-            }
-
-            if use_stream {
-                // Stream mode: write SQL directly to the output stream
-                let stream = self.config.output_stream.as_ref().unwrap();
-                let mut insert_buf: Vec<u8> = Vec::new();
-                let mut update_buf: Vec<u8> = Vec::new();
-
-                match diff.execute(&mut insert_buf, &mut update_buf).await {
-                    Ok(stats) => {
-                        table_report.inserts = stats.inserts;
-                        table_report.updates = stats.updates;
-
-                        // Write buffered SQL to the stream
-                        let mut locked = stream.lock().map_err(|e| {
-                            DataDiffError::Config(format!("Failed to lock output stream: {}", e))
-                        })?;
-                        if !insert_buf.is_empty() {
-                            locked.write_all(&insert_buf)?;
-                        }
-                        if !update_buf.is_empty() {
-                            locked.write_all(&update_buf)?;
-                        }
-
-                        self.config
-                            .emit_progress(ProgressEvent::TableDiffComplete {
-                                table: target_tname.to_string(),
-                                inserts: stats.inserts,
-                                updates: stats.updates,
-                            });
-                    }
-                    Err(e) => {
-                        if let Some(warning) = diff_error_to_warning(&e) {
-                            warn!("{}", warning);
-                            report.warnings.push(warning);
-                            report.tables.push(table_report);
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                }
-
-                // DELETE phase to stream
-                if self.config.include_delete {
-                    let mut delete_buf: Vec<u8> = Vec::new();
-
-                    let mut del_sync = TableDeleteSync::new(
-                        &target_conn,
-                        &ref_conn,
-                        table_pair.target.clone(),
-                        table_pair.reference.clone(),
-                    );
-                    del_sync.set_chunk_size(self.config.chunk_size);
-                    del_sync.set_alternate_keys(alternate_keys);
-
-                    match del_sync.execute(&mut delete_buf).await {
-                        Ok(deletes) => {
-                            table_report.deletes = deletes;
-                            if !delete_buf.is_empty() {
-                                let mut locked = stream.lock().map_err(|e| {
-                                    DataDiffError::Config(format!(
-                                        "Failed to lock output stream: {}",
-                                        e
-                                    ))
-                                })?;
-                                locked.write_all(&delete_buf)?;
-                            }
-                            self.config
-                                .emit_progress(ProgressEvent::TableDeleteComplete {
-                                    table: target_tname.to_string(),
-                                    deletes,
-                                });
-                        }
-                        Err(DataDiffError::NoPrimaryKey(_)) => {
-                            debug!(
-                                "Skipping delete sync for {} - no PK",
-                                table_pair.target
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-            } else {
-                // File mode: write SQL to per-table files (default)
-                let insert_filename = format!("{}_$insert.sql", target_tname);
-                let update_filename = format!("{}_$update.sql", target_tname);
-                let insert_path = self.config.output_dir.join(&insert_filename);
-                let update_path = self.config.output_dir.join(&update_filename);
-
-                let mut insert_file = BufWriter::new(File::create(&insert_path)?);
-                let mut update_file = BufWriter::new(File::create(&update_path)?);
-
-                match diff.execute(&mut insert_file, &mut update_file).await {
-                    Ok(stats) => {
-                        table_report.inserts = stats.inserts;
-                        table_report.updates = stats.updates;
-
-                        self.config
-                            .emit_progress(ProgressEvent::TableDiffComplete {
-                                table: target_tname.to_string(),
-                                inserts: stats.inserts,
-                                updates: stats.updates,
-                            });
-                    }
-                    Err(e) => {
-                        if let Some(warning) = diff_error_to_warning(&e) {
-                            warn!("{}", warning);
-                            report.warnings.push(warning);
-                            cleanup_empty(&insert_path);
-                            cleanup_empty(&update_path);
-                            report.tables.push(table_report);
-                            continue;
-                        }
-                        return Err(e);
-                    }
-                }
-
-                drop(insert_file);
-                drop(update_file);
-
-                // Track which files have content
-                if file_has_content(&insert_path) {
-                    table_report.insert_file = Some(insert_filename.clone());
+    /// A file written: its name when it holds SQL, else removed
+    fn keep(self) -> io::Result<Option<String>> {
+        match self {
+            Part::File { name, path, w } => {
+                w.into_inner().map_err(|e| e.into_error())?;
+                if fs::metadata(&path)?.len() > 0 {
+                    Ok(Some(name))
                 } else {
-                    cleanup_empty(&insert_path);
-                }
-                if file_has_content(&update_path) {
-                    table_report.update_file = Some(update_filename.clone());
-                } else {
-                    cleanup_empty(&update_path);
-                }
-
-                // DELETE phase
-                if self.config.include_delete {
-                    let delete_filename = format!("{}_$delete.sql", target_tname);
-                    let delete_path = self.config.output_dir.join(&delete_filename);
-                    let mut delete_file = BufWriter::new(File::create(&delete_path)?);
-
-                    let mut del_sync = TableDeleteSync::new(
-                        &target_conn,
-                        &ref_conn,
-                        table_pair.target.clone(),
-                        table_pair.reference.clone(),
-                    );
-                    del_sync.set_chunk_size(self.config.chunk_size);
-                    del_sync.set_alternate_keys(alternate_keys);
-
-                    match del_sync.execute(&mut delete_file).await {
-                        Ok(deletes) => {
-                            table_report.deletes = deletes;
-                            self.config
-                                .emit_progress(ProgressEvent::TableDeleteComplete {
-                                    table: target_tname.to_string(),
-                                    deletes,
-                                });
-                        }
-                        Err(DataDiffError::NoPrimaryKey(_)) => {
-                            debug!(
-                                "Skipping delete sync for {} - no PK",
-                                table_pair.target
-                            );
-                        }
-                        Err(e) => return Err(e),
-                    }
-
-                    drop(delete_file);
-
-                    if file_has_content(&delete_path) {
-                        table_report.delete_file = Some(delete_filename);
-                    } else {
-                        cleanup_empty(&delete_path);
-                    }
+                    fs::remove_file(&path)?;
+                    Ok(None)
                 }
             }
-
-            report.tables.push(table_report);
+            Part::Buf(_) => Ok(None),
         }
-
-        // ---------------------------------------------------------------
-        // Phase 4: Master Script (file mode only)
-        // ---------------------------------------------------------------
-        if !self.cancelled && !use_stream {
-            self.write_master_script(&report)?;
-            report.master_script = Some(
-                self.config
-                    .output_file
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-
-        Ok(report)
     }
 
-    /// Write the master SQL script that includes all per-table scripts.
-    fn write_master_script(&self, report: &DiffReport) -> Result<()> {
-        let mut out = BufWriter::new(File::create(&self.config.output_file)?);
-
-        writeln!(out, "-- ----------------------------------------------------------------")?;
-        writeln!(out, "-- Data migration script")?;
-        writeln!(out, "-- ----------------------------------------------------------------")?;
-        writeln!(out)?;
-        writeln!(out, "-- Tables included:")?;
-        for table in &report.tables {
-            writeln!(out, "-- {}", table.table_name)?;
+    fn into_buf(self) -> Vec<u8> {
+        match self {
+            Part::Buf(v) => v,
+            Part::File { .. } => Vec::new(),
         }
-        writeln!(out)?;
+    }
+}
 
-        // Warnings
-        if !report.warnings.is_empty() {
-            writeln!(out, "-- Warnings:")?;
-            for w in &report.warnings {
-                writeln!(out, "-- {}", w)?;
-            }
-            writeln!(out)?;
-        }
-
-        // INSERT/UPDATE scripts
-        writeln!(out, "-- ----------------------")?;
-        writeln!(out, "-- UPDATE/INSERT scripts")?;
-        writeln!(out, "-- ----------------------")?;
-
-        let mut has_updates = false;
-        for table in &report.tables {
-            if let Some(ref f) = table.insert_file {
-                writeln!(out, "\\i '{}'", f)?;
-                has_updates = true;
-            } else {
-                writeln!(
-                    out,
-                    "-- No INSERTs for {} necessary",
-                    table.table_name
-                )?;
-            }
-            if let Some(ref f) = table.update_file {
-                writeln!(out, "\\i '{}'", f)?;
-                has_updates = true;
-            } else {
-                writeln!(
-                    out,
-                    "-- No UPDATEs for {} necessary",
-                    table.table_name
-                )?;
+impl TableSql {
+    /// A table not compared: its files removed
+    fn discard(self) {
+        for part in [self.insert, self.update, self.delete] {
+            if let Part::File { path, w, .. } = part {
+                drop(w);
+                let _ = fs::remove_file(path);
             }
         }
+    }
+}
 
-        if has_updates {
-            writeln!(out)?;
-            writeln!(out, "COMMIT;")?;
+impl Output {
+    fn open(config: &DiffConfig) -> Result<Output> {
+        if let Some(out) = &config.output_stream {
+            return Ok(Output::Stream { out: out.clone(), deletes: Vec::new(), file: None });
         }
+        if config.single_file {
+            if let Some(dir) = config.output_file.parent().filter(|d| !d.as_os_str().is_empty()) {
+                fs::create_dir_all(dir)?;
+            }
+            let file: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(BufWriter::new(File::create(&config.output_file)?)));
+            return Ok(Output::Stream { out: file, deletes: Vec::new(), file: Some(config.output_file.clone()) });
+        }
+        fs::create_dir_all(&config.output_dir)?;
+        Ok(Output::Files { dir: config.output_dir.clone() })
+    }
 
-        // DELETE scripts
-        let has_deletes = report.tables.iter().any(|t| t.delete_file.is_some());
-        if self.config.include_delete {
-            writeln!(out)?;
-            writeln!(out, "-- ---------------")?;
-            writeln!(out, "-- DELETE scripts")?;
-            writeln!(out, "-- ---------------")?;
+    /// Where one table's SQL is written
+    fn table(&self, table: &str) -> Result<TableSql> {
+        Ok(match self {
+            Output::Files { dir } => TableSql {
+                insert: Part::file(dir, format!("{}_$insert.sql", table))?,
+                update: Part::file(dir, format!("{}_$update.sql", table))?,
+                delete: Part::file(dir, format!("{}_$delete.sql", table))?,
+            },
+            Output::Stream { .. } => {
+                TableSql { insert: Part::Buf(Vec::new()), update: Part::Buf(Vec::new()), delete: Part::Buf(Vec::new()) }
+            }
+        })
+    }
 
-            for table in &report.tables {
-                if let Some(ref f) = table.delete_file {
-                    writeln!(out, "\\i '{}'", f)?;
-                } else {
-                    writeln!(
-                        out,
-                        "-- No DELETEs for {} necessary",
-                        table.table_name
-                    )?;
+    /// A table compared: its files kept, or its INSERTs and UPDATEs streamed and its DELETEs kept for the end
+    fn done(&mut self, sql: TableSql, report: &mut TableDiffReport) -> Result<()> {
+        match self {
+            Output::Files { .. } => {
+                report.insert_file = sql.insert.keep()?;
+                report.update_file = sql.update.keep()?;
+                report.delete_file = sql.delete.keep()?;
+            }
+            Output::Stream { out, deletes, .. } => {
+                let mut locked = lock(out)?;
+                locked.write_all(&sql.insert.into_buf())?;
+                locked.write_all(&sql.update.into_buf())?;
+                let delete = sql.delete.into_buf();
+                if !delete.is_empty() {
+                    deletes.push(delete);
                 }
             }
+        }
+        Ok(())
+    }
 
-            if has_deletes {
-                writeln!(out)?;
-                writeln!(out, "COMMIT;")?;
+    /// Every table compared: the master script written, or the DELETEs streamed and the stream flushed
+    fn finish(self, config: &DiffConfig, report: &mut DiffReport) -> Result<()> {
+        match self {
+            Output::Files { .. } => {
+                write_master_script(config, report)?;
+                report.master_script = Some(config.output_file.to_string_lossy().into_owned());
+            }
+            Output::Stream { out, mut deletes, file } => {
+                if config.check_dependencies {
+                    deletes.reverse();
+                }
+                let mut locked = lock(&out)?;
+                for d in &deletes {
+                    locked.write_all(d)?;
+                }
+                locked.flush()?;
+                report.master_script = file.map(|f| f.to_string_lossy().into_owned());
             }
         }
-
-        out.flush()?;
         Ok(())
     }
 }
 
-/// Convert recoverable diff errors into warning strings, returning None for fatal errors.
-fn diff_error_to_warning(e: &DataDiffError) -> Option<String> {
-    match e {
-        DataDiffError::TableNotFound(t) => Some(format!("Table not found: {}", t)),
-        DataDiffError::NoPrimaryKey(t) => Some(format!("No primary key for table: {}", t)),
-        DataDiffError::ColumnMismatch {
-            ref_table,
-            target_table,
-        } => Some(format!(
-            "Column mismatch between {} and {}",
-            ref_table, target_table
-        )),
-        _ => None,
+/// The master SQL script that includes every table's scripts: INSERTs and UPDATEs in table order, then the
+/// DELETEs - children first with `check_dependencies`.
+fn write_master_script(config: &DiffConfig, report: &DiffReport) -> Result<()> {
+    let mut out = BufWriter::new(File::create(&config.output_file)?);
+
+    writeln!(out, "-- ----------------------------------------------------------------")?;
+    writeln!(out, "-- Data migration script")?;
+    writeln!(out, "-- ----------------------------------------------------------------")?;
+    writeln!(out)?;
+    writeln!(out, "-- Tables included:")?;
+    for table in &report.tables {
+        writeln!(out, "-- {}", table.table_name)?;
     }
+    writeln!(out)?;
+
+    if !report.warnings.is_empty() {
+        writeln!(out, "-- Warnings:")?;
+        for w in &report.warnings {
+            writeln!(out, "-- {}", w)?;
+        }
+        writeln!(out)?;
+    }
+
+    writeln!(out, "-- ----------------------")?;
+    writeln!(out, "-- UPDATE/INSERT scripts")?;
+    writeln!(out, "-- ----------------------")?;
+
+    let mut has_updates = false;
+    for table in &report.tables {
+        if let Some(ref f) = table.insert_file {
+            writeln!(out, "\\i '{}'", f)?;
+            has_updates = true;
+        } else {
+            writeln!(out, "-- No INSERTs for {} necessary", table.table_name)?;
+        }
+        if let Some(ref f) = table.update_file {
+            writeln!(out, "\\i '{}'", f)?;
+            has_updates = true;
+        } else {
+            writeln!(out, "-- No UPDATEs for {} necessary", table.table_name)?;
+        }
+    }
+
+    if has_updates {
+        writeln!(out)?;
+        writeln!(out, "COMMIT;")?;
+    }
+
+    if config.include_delete {
+        writeln!(out)?;
+        writeln!(out, "-- ---------------")?;
+        writeln!(out, "-- DELETE scripts")?;
+        writeln!(out, "-- ---------------")?;
+
+        let mut tables: Vec<&TableDiffReport> = report.tables.iter().collect();
+        if config.check_dependencies {
+            tables.reverse();
+        }
+        for table in &tables {
+            if let Some(ref f) = table.delete_file {
+                writeln!(out, "\\i '{}'", f)?;
+            } else {
+                writeln!(out, "-- No DELETEs for {} necessary", table.table_name)?;
+            }
+        }
+
+        if tables.iter().any(|t| t.delete_file.is_some()) {
+            writeln!(out)?;
+            writeln!(out, "COMMIT;")?;
+        }
+    }
+
+    out.flush()?;
+    Ok(())
 }
 
-fn file_has_content(path: &std::path::Path) -> bool {
-    fs::metadata(path)
-        .map(|m| m.len() > 0)
-        .unwrap_or(false)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
 
-fn cleanup_empty(path: &std::path::Path) {
-    if !file_has_content(path) {
-        let _ = fs::remove_file(path);
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("diff_data_unit_{}_{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn config(out: &Path) -> DiffConfig {
+        // the pools connect lazily: nothing is reached here
+        let pool = crate::create_pool("host=127.0.0.1 port=1 user=nobody").await.unwrap();
+        DiffConfig::new(pool.clone(), pool, out.join("master.sql"))
+    }
+
+    #[test]
+    fn a_table_that_cannot_be_compared_is_recoverable_and_nothing_else_is() {
+        assert!(recoverable(&DataDiffError::TableNotFound("t".into())));
+        assert!(recoverable(&DataDiffError::NoPrimaryKey("t".into())));
+        assert!(recoverable(&DataDiffError::ColumnMismatch { ref_table: "a".into(), target_table: "b".into() }));
+        assert!(!recoverable(&DataDiffError::Cancelled));
+    }
+
+    #[test]
+    fn an_empty_file_is_removed_a_full_one_kept_and_a_discarded_table_leaves_none() {
+        let dir = scratch("parts");
+        let mut full = Part::file(&dir, "full.sql".into()).unwrap();
+        full.write_all(b"x").unwrap();
+        full.flush().unwrap();
+        assert_eq!(full.keep().unwrap(), Some("full.sql".to_string()));
+        assert_eq!(Part::file(&dir, "empty.sql".into()).unwrap().keep().unwrap(), None);
+        assert!(dir.join("full.sql").exists() && !dir.join("empty.sql").exists());
+        assert_eq!(Part::Buf(b"y".to_vec()).keep().unwrap(), None);
+        assert!(Part::file(&dir, "f.sql".into()).unwrap().into_buf().is_empty());
+
+        let files = Output::Files { dir: dir.clone() };
+        let sql = files.table("t").unwrap();
+        assert!(dir.join("t_$insert.sql").exists());
+        sql.discard();
+        assert!(!dir.join("t_$insert.sql").exists() && !dir.join("t_$delete.sql").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stream_takes_each_tables_inserts_and_updates_then_the_deletes_children_first() {
+        let dir = scratch("stream");
+        let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut config = config(&dir).await;
+        config.output_stream = Some(buf.clone());
+        let mut out = Output::open(&config).unwrap();
+        for (table, sql) in [("parent", "p"), ("child", "c")] {
+            let mut t = out.table(table).unwrap();
+            write!(t.insert, "i{} ", sql).unwrap();
+            write!(t.update, "u{} ", sql).unwrap();
+            write!(t.delete, "d{} ", sql).unwrap();
+            assert!(t.insert.flush().is_ok());
+            out.done(t, &mut TableDiffReport::default()).unwrap();
+        }
+        let empty = out.table("none").unwrap();
+        out.done(empty, &mut TableDiffReport::default()).unwrap();
+        let mut report = DiffReport::default();
+        out.finish(&config, &mut report).unwrap();
+        assert_eq!(String::from_utf8(buf.lock().unwrap().clone()).unwrap(), "ip up ic uc dc dp ");
+        assert!(report.master_script.is_none());
+
+        // the one file: as the stream, its path the report's script
+        config.output_stream = None;
+        config.single_file = true;
+        config.check_dependencies = false;
+        config.output_file = dir.join("sub").join("all.sql");
+        let mut out = Output::open(&config).unwrap();
+        for table in ["a", "b"] {
+            let mut t = out.table(table).unwrap();
+            write!(t.delete, "d{} ", table).unwrap();
+            out.done(t, &mut TableDiffReport::default()).unwrap();
+        }
+        let mut report = DiffReport::default();
+        out.finish(&config, &mut report).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("sub").join("all.sql")).unwrap(), "da db ", "as given, unordered");
+        assert_eq!(report.master_script.as_deref(), Some(dir.join("sub").join("all.sql").to_str().unwrap()));
+
+        // a poisoned stream is refused
+        let poisoned: Arc<Mutex<dyn Write + Send>> = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let p = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = p.lock().unwrap();
+            panic!("poison");
+        })
+        .join();
+        assert!(matches!(lock(&poisoned), Err(DataDiffError::Config(m)) if m.starts_with("DA-E014 ")));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_master_script_includes_each_file_and_says_what_has_none() {
+        let dir = scratch("master");
+        let mut config = config(&dir).await;
+        config.include_delete = true;
+        let report = DiffReport {
+            tables: vec![
+                TableDiffReport {
+                    table_name: "users".into(),
+                    inserts: 1,
+                    updates: 1,
+                    deletes: 1,
+                    insert_file: Some("users_$insert.sql".into()),
+                    update_file: Some("users_$update.sql".into()),
+                    delete_file: Some("users_$delete.sql".into()),
+                },
+                TableDiffReport { table_name: "orders".into(), ..Default::default() },
+            ],
+            warnings: vec!["DA-E005 table not found: gone".into()],
+            master_script: None,
+        };
+        write_master_script(&config, &report).unwrap();
+        let text = fs::read_to_string(dir.join("master.sql")).unwrap();
+        assert!(text.contains("-- Tables included:\n-- users\n-- orders\n"));
+        assert!(text.contains("-- Warnings:\n-- DA-E005 table not found: gone\n"));
+        assert!(text.contains("\\i 'users_$insert.sql'\n\\i 'users_$update.sql'\n"));
+        assert!(text.contains("-- No INSERTs for orders necessary\n-- No UPDATEs for orders necessary\n"));
+        assert!(text.contains("-- DELETE scripts"));
+        // children first: in delete order, the reverse of the tables'
+        assert!(text.contains("-- No DELETEs for orders necessary\n\\i 'users_$delete.sql'\n"), "{}", text);
+        assert_eq!(text.matches("COMMIT;").count(), 2);
+
+        // unordered: the deletes as the tables are
+        config.check_dependencies = false;
+        write_master_script(&config, &report).unwrap();
+        let text = fs::read_to_string(dir.join("master.sql")).unwrap();
+        assert!(text.contains("\\i 'users_$delete.sql'\n-- No DELETEs for orders necessary\n"), "{}", text);
+
+        // nothing to include, no deletes asked: no COMMIT, no DELETE section
+        config.include_delete = false;
+        let quiet = DiffReport { tables: vec![TableDiffReport { table_name: "orders".into(), ..Default::default() }], ..Default::default() };
+        write_master_script(&config, &quiet).unwrap();
+        let text = fs::read_to_string(dir.join("master.sql")).unwrap();
+        assert!(!text.contains("COMMIT;") && !text.contains("DELETE scripts") && !text.contains("Warnings"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

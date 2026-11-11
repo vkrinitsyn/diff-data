@@ -6,13 +6,33 @@
 [![coverage](https://raw.githubusercontent.com/vkrinitsyn/diff-data/badges/coverage.svg?sanitize=true)](https://github.com/vkrinitsyn/diff-data/actions/workflows/coverage.yml)
 [![license](https://img.shields.io/github/license/vkrinitsyn/diff-data.svg)](LICENSE)
 
-PostgreSQL DB data diff compare
+PostgreSQL data diff: the SQL (INSERT, UPDATE, DELETE) that makes a target database's rows a reference's,
+as a library any project calls (sge, ytctl) and as a command line, `diff_data`.
 
-## Identify schema diff:
-use schema_guard_tokio crate fn load_info_schema() from ..\schema_guard\ to get table schema, and compare (use diff_doc from ..\diff-doc-rs) with source and target,
-if mismatch but target has more columns than source OR table is in exclusion, than proceed with diff, otherwise,
-skip diff and output a message of schema mismatch and request to add table to exclusion or define a timestamp column for diff.
-remove ignore_missing_target
+**The data only.** Schemas are compared by sge (Schema Guard Enterprise, `sge::dbm_compare`): when a
+comprehensive diff is required - schema and data - use sge, for the schema, with diff_data for the data.
+diff_data checks only what a data diff needs of a schema: that the target has each reference column, and
+which key a row is matched by.
+
+## As a library
+
+```toml
+diff_data = { version = "0.4", default-features = false }   # without the command line (clap)
+```
+
+`diff_data::run_diff(DiffConfig)` runs the diff; `DataDiff` its parts: the tables (the configured pairs, else
+every table of `reference_schema`), each table's chunk strategy and the estimated time, the per-table diff,
+and the output - a file per table and kind with a master script, one file (`single_file`), or a stream
+(`output_stream`). With `check_dependencies` (the default) the tables go parents first by their foreign keys,
+and every DELETE comes after every INSERT and UPDATE, children first: the SQL applies as written.
+
+## Messages and error codes
+
+Every message is in English, Russian and - not reviewed - French, German, Simplified Chinese and Japanese:
+`locales/<lang>.yml`, one file per language. The language is `diff_data::i18n::set_lang`'s, else `LANG`'s
+(the command line: `--locale`, else `DIFF_DATA_LOCALE`). An error starts with its code, `DA-Ennn`, the same
+in every language and described at [docs.dbinvent.com](https://docs.dbinvent.com) (`DD-` is diff-doc's,
+`SGE-` sge's). A new error takes the next code; a code is never reused.
 
 ## Identify chunk strategy:
 
@@ -60,6 +80,18 @@ one table across N copies - the nodes of a cluster - as YT Cluster does it (2026
 - `cluster::placement` - which nodes of a YT Cluster hold a table (its `yt_info('P')` row), and why a
   table cannot be repaired from one primary (sharded, held by zone, another database).
 
-The SQL builders and the vote are pure; the reads take a `tokio_postgres::Client`. The live test runs
-against a PostgreSQL of your own: `DIFF_DATA_PG="host=127.0.0.1 port=5432 user=postgres" cargo test
---test cluster_live` (it creates and drops `dd_cluster_primary` and `dd_cluster_node`).
+The SQL builders and the vote are pure; the reads take a `tokio_postgres::Client`.
+
+## Tests
+
+`cargo test` runs the unit tests alone. The live tests run against a PostgreSQL of your own, as a superuser
+(a "large" table is one whose `pg_class.reltuples` a test sets past 1M rows):
+`DIFF_DATA_PG="host=127.0.0.1 port=5432 user=postgres" cargo test`. Without `DIFF_DATA_PG` they do nothing.
+Each creates and drops its own databases, all named `dd_*`:
+
+- `tests/diff_live.rs` - the reference/target diff: `DataDiff` in file, stream, single-file and checksum modes,
+  a whole schema by its foreign keys, every column type round-tripped, and its parts;
+- `tests/cluster_live.rs` - the cluster compare (`dd_cluster_primary`, `dd_cluster_node`, `dd_edges_*`);
+- `tests/cli.rs` - the `diff_data` binary, run as a user runs it.
+
+Line coverage: `DIFF_DATA_PG=... cargo llvm-cov`; CI fails under 90%.

@@ -19,7 +19,7 @@
 pub fn safe_ident(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 63
-        && s.chars().next().map_or(false, |c| c.is_ascii_alphabetic() || c == '_')
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
@@ -93,10 +93,10 @@ pub fn is_frame_key_type(oid: u32) -> bool {
 /// `ts_col` (review 2026-11-11); `rel` is the caller's, as in ytserv
 pub fn frames_sql(rel: &str, key: &str, n: u32, ignore: &[String], ts_col: &str, filter: &str) -> Result<String, String> {
     if !safe_ident(key) {
-        return Err(format!("the frame key [{}] is not a plain column name", key));
+        return Err(tr!("error.recon_frame_key", key = key));
     }
     if !ts_col.is_empty() && !safe_ident(ts_col) {
-        return Err(format!("the last-update column [{}] is not a plain column name", ts_col));
+        return Err(tr!("error.recon_ts_col", column = ts_col));
     }
     let n = n.clamp(1, 4096);
     let basis = row_basis(ignore);
@@ -240,13 +240,11 @@ pub fn decide(votes: &[WriterVote], writer_decides: bool, wal: impl Fn((u64, u32
         [(c, _)] => return Verdict::Unanimous(*c),
         _ => {}
     }
-    if writer_decides {
-        if let Some(newest) = newest_writer(votes) {
-            if let Some(copy) = writer_of(votes, newest, wal(newest)).and_then(|o| origin_copy(votes, o)) {
+    if writer_decides
+        && let Some(newest) = newest_writer(votes)
+            && let Some(copy) = writer_of(votes, newest, wal(newest)).and_then(|o| origin_copy(votes, o)) {
                 return Verdict::Winner(copy);
             }
-        }
-    }
     let voters = votes.len();
     tally.iter().find(|(_, n)| *n * 2 > voters).map_or(Verdict::Blocked, |(c, _)| Verdict::Winner(*c))
 }

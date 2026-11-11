@@ -170,10 +170,10 @@ impl Shape {
     /// From the primary's catalog rows and the table's rules
     pub fn new(pk: Vec<String>, cols: Vec<Col>, rules: &TableRules) -> Result<Self, String> {
         if pk.is_empty() {
-            return Err("no primary key: its rows have no identity to compare by".into());
+            return Err(tr!("error.cluster_no_key"));
         }
         if let Some(k) = pk.iter().find(|k| rules.ignore.contains(k)) {
-            return Err(format!("{} is in the key and in ignore_col", k));
+            return Err(tr!("error.cluster_key_ignored", column = k));
         }
         Ok(Shape { pk, cols, ignored: rules.ignore.clone(), filter: rules.filter.clone() })
     }
@@ -285,8 +285,7 @@ pub fn ids_of(rows: impl IntoIterator<Item = (String, String)>) -> Result<BTreeM
     let mut out = BTreeMap::new();
     for (id, v) in rows {
         if out.insert(id.clone(), v).is_some() {
-            return Err(format!("two rows render the id [{}]: a key value holding '|', or a float key - \
-                its rows have no one identity to compare by", id));
+            return Err(tr!("error.cluster_ambiguous_id", id = id));
         }
     }
     Ok(out)
@@ -532,7 +531,7 @@ pub async fn first_key_is_integer(c: &Client, schema: &str, table: &str, shape: 
     let rel = table_of(schema, table);
     let key = shape.range_col();
     let row = c.query_opt(KEY_TYPE_SQL, &[&rel, &key]).await.map_err(|e| pg_text(&e))?;
-    Ok(row.map_or(false, |r| matches!(r.get::<_, String>(0).as_str(), "smallint" | "integer" | "bigint")))
+    Ok(row.is_some_and(|r| matches!(r.get::<_, String>(0).as_str(), "smallint" | "integer" | "bigint")))
 }
 
 /// The smallest and largest first key of the rows (the filter's); None when there are none
@@ -823,6 +822,7 @@ mod tests {
         assert!(!pages_by_second_key(KeyRange { lo: 5, hi: 9 }, 2), "several keys: read whole");
         assert_eq!(page_cut(Some("b"), Some("a")), Some("a".to_string()));
         assert_eq!(page_cut(Some("b"), None), Some("b".to_string()), "a short node page is complete");
+        assert_eq!(page_cut(None, Some("c")), Some("c".to_string()), "a short primary page is complete");
         assert_eq!(page_cut(None, None), None, "the last page of both");
     }
 

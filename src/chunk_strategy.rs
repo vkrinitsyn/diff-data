@@ -167,12 +167,34 @@ pub async fn determine_strategy(
             if is_excluded {
                 Ok((ChunkStrategy::IdChunkLargeExcluded, None))
             } else {
-                Err(DataDiffError::Config(format!(
-                    "Table '{}' has >1M rows but no timestamp column detected. \
-                     Define a timestamp column in config (timestamp_column) or add the table to the exclusion list.",
-                    schema_qualified_name
-                )))
+                Err(DataDiffError::Config(tr!("error.large_no_timestamp", table = schema_qualified_name)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use postgres_types::Type;
+
+    fn col(name: &str, pg_type: Type) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), pg_type, is_pk: false, is_identity: false, identity_always: false, ordinal: 0 }
+    }
+
+    #[test]
+    fn the_timestamp_column_is_the_configured_one_then_update_then_create() {
+        let cols = vec![
+            col("id", Type::INT4),
+            col("updated_by", Type::TEXT),
+            col("Created_On", Type::DATE),
+            col("UpdatedAt", Type::TIMESTAMPTZ),
+            col("seen", Type::TIMESTAMP),
+        ];
+        assert_eq!(detect_timestamp_column(&cols, Some("SEEN")), Some("SEEN".to_string()));
+        // a configured column the table lacks falls back to detection
+        assert_eq!(detect_timestamp_column(&cols, Some("missing")), Some("UpdatedAt".to_string()));
+        assert_eq!(detect_timestamp_column(&cols[..3], None), Some("Created_On".to_string()));
+        assert_eq!(detect_timestamp_column(&cols[..2], None), None);
     }
 }

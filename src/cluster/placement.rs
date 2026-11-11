@@ -11,7 +11,7 @@ pub struct Placing {
 }
 
 fn is_set(v: &Option<String>) -> bool {
-    v.as_deref().map_or(false, |s| !s.trim().is_empty())
+    v.as_deref().is_some_and(|s| !s.trim().is_empty())
 }
 
 /// Why a table cannot be diffed against one primary, if it cannot
@@ -45,7 +45,7 @@ impl Placement {
         if u.len() != 36 || !u.is_ascii() {
             return false;
         }
-        self.holders.iter().any(|h| h.split_once("..").map_or(false, |(a, b)| a == &u[..2] && b == &u[30..]))
+        self.holders.iter().any(|h| h.split_once("..").is_some_and(|(a, b)| a == &u[..2] && b == &u[30..]))
     }
 }
 

@@ -39,10 +39,6 @@ pub enum ProgressEvent {
     TableDeleteComplete { table: String, deletes: u64 },
     /// Sorting tables by foreign key dependencies.
     SortingDependencies,
-    /// Starting schema comparison phase.
-    SchemaCompareStart,
-    /// Schema comparison result for a table.
-    SchemaCompareResult { table: String, result: String },
     /// Starting ETC estimation phase.
     EstimationStart { total_tables: usize },
     /// ETC estimation complete for a single table.
@@ -61,14 +57,14 @@ pub enum ProgressEvent {
     },
 }
 
-/// Configuration for a data diff operation.
+/// Configuration for a data diff operation: the data only - a schema compare is sge's.
 #[derive(Clone)]
 pub struct DiffConfig {
     /// Connection pool for the reference (source) database.
     pub reference_pool: PgPool,
     /// Connection pool for the target database.
     pub target_pool: PgPool,
-    /// Explicit table pairs to compare. If empty, tables are discovered from schemas.
+    /// Explicit table pairs to compare. If empty, every table of `reference_schema` is compared.
     pub tables: Vec<TablePair>,
     /// Directory where output files are written.
     pub output_dir: PathBuf,
@@ -87,17 +83,20 @@ pub struct DiffConfig {
     pub exclude_real_pk: bool,
     /// Exclude ignored columns from generated SQL output.
     pub exclude_ignored_columns: bool,
-    /// Additional WHERE condition applied to all reference table queries.
-    /// Do not include the WHERE keyword itself.
+    /// A condition on every reference table's rows, without the WHERE keyword (one there is taken off):
+    /// only the rows it takes are compared. A delete is still of a target row the whole reference
+    /// table lacks. Checksums are of every row.
     pub table_where: Option<String>,
-    /// Write all SQL into a single file instead of separate per-table files.
+    /// Write all SQL into `output_file` instead of separate per-table files and a master script:
+    /// every table's INSERTs and UPDATEs, then the DELETEs.
     pub single_file: bool,
     /// Reference schema for auto-discovering tables. When set and `tables` is empty,
     /// all tables from this schema are compared.
     pub reference_schema: Option<String>,
     /// Target schema to compare against. Used with `reference_schema`.
     pub target_schema: Option<String>,
-    /// Table names to exclude from comparison (case-insensitive).
+    /// Tables (lowercase names, schema left out) of over 1M rows without a timestamp column that are
+    /// compared row by row (`IdChunkLargeExcluded`) rather than refused. Every table is compared.
     pub exclude_tables: HashSet<String>,
     /// Sort generated scripts by foreign key dependencies.
     /// INSERT/UPDATE scripts sorted for insert order, DELETE scripts for delete order.
@@ -113,9 +112,9 @@ pub struct DiffConfig {
     pub force: bool,
     /// Emit progress events (default: true).
     pub show_progress: bool,
-    /// Reference database name for schema_guard_tokio schema loading.
+    /// Reference database name, recorded in its checksum manifest.
     pub reference_db_name: Option<String>,
-    /// Target database name for schema_guard_tokio schema loading.
+    /// Target database name, recorded in its checksum manifest.
     pub target_db_name: Option<String>,
     /// Maximum estimated time in seconds before aborting (default: 10800.0 = 3h).
     pub max_etc_seconds: f64,
@@ -232,5 +231,46 @@ pub fn parse_table_name(name: &str) -> (Option<&str>, &str) {
         (Some(schema), table)
     } else {
         (None, name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_table_name_splits_at_its_first_dot() {
+        assert_eq!(parse_table_name("users"), (None, "users"));
+        assert_eq!(parse_table_name("public.users"), (Some("public"), "users"));
+        assert_eq!(parse_table_name("a.b.c"), (Some("a"), "b.c"));
+    }
+
+    #[tokio::test]
+    async fn a_new_config_has_the_documented_defaults_and_reports_progress() {
+        // the pools connect lazily: nothing is reached here
+        let pool = crate::create_pool("host=127.0.0.1 port=1 user=nobody").await.unwrap();
+        let cfg = DiffConfig::new(pool.clone(), pool.clone(), PathBuf::from("out/master.sql"));
+        assert_eq!(cfg.output_dir, PathBuf::from("out"));
+        assert_eq!(cfg.chunk_size, 25);
+        assert!(!cfg.include_delete && cfg.check_dependencies && cfg.show_progress && !cfg.checksum_only);
+        assert_eq!(cfg.max_etc_seconds, 10800.0);
+        // no callback: nothing happens
+        cfg.emit_progress(ProgressEvent::SortingDependencies);
+
+        let root = DiffConfig::new(pool.clone(), pool.clone(), PathBuf::from("/"));
+        assert_eq!(root.output_dir, PathBuf::from("."));
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut cfg = cfg;
+        cfg.on_progress = Some(Arc::new(move |e: ProgressEvent| sink.lock().unwrap().push(format!("{:?}", e))));
+        cfg.output_stream = Some(Arc::new(Mutex::new(Vec::<u8>::new())));
+        cfg.emit_progress(ProgressEvent::SortingDependencies);
+        assert_eq!(*seen.lock().unwrap(), vec!["SortingDependencies".to_string()]);
+
+        let dbg = format!("{:?}", cfg);
+        assert!(dbg.starts_with("DiffConfig {"));
+        assert!(dbg.contains("output_stream: Some(\"...\")") && dbg.contains("on_progress: Some(\"...\")"));
+        assert!(dbg.contains("max_etc_seconds: 10800.0"));
     }
 }

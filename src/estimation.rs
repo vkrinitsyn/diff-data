@@ -164,12 +164,11 @@ pub async fn analyze_and_estimate(
     });
 
     if total_etc > config.max_etc_seconds && !config.force {
-        return Err(DataDiffError::Config(format!(
-            "Estimated time to completion: {:.0}s ({:.1}h) exceeds maximum allowed {:.0}s. \
-             Use force=true to override.",
-            total_etc,
-            total_etc / 3600.0,
-            config.max_etc_seconds
+        return Err(DataDiffError::Config(tr!(
+            "error.too_long",
+            seconds = format!("{:.0}", total_etc),
+            hours = format!("{:.1}", total_etc / 3600.0),
+            max = format!("{:.0}", config.max_etc_seconds),
         )));
     }
 

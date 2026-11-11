@@ -45,19 +45,6 @@ pub struct TableAnalysis {
     pub estimated_seconds: f64,
 }
 
-/// Result of comparing schemas between reference and target for a single table.
-#[derive(Debug, Clone)]
-pub enum SchemaComparisonResult {
-    /// Schemas match exactly (only comparing shared columns).
-    Match,
-    /// Target has all reference columns plus extra columns.
-    TargetSuperset { extra_columns: Vec<String> },
-    /// Table is in the exclusion list.
-    Excluded,
-    /// Schemas differ in incompatible ways.
-    Mismatch { message: String },
-}
-
 /// Dynamic value extracted from a PostgreSQL row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RowValue {
@@ -86,7 +73,10 @@ pub struct ColumnInfo {
     pub name: String,
     pub pg_type: Type,
     pub is_pk: bool,
+    /// an identity column (or a serial: its default a `nextval`)
     pub is_identity: bool,
+    /// `GENERATED ALWAYS AS IDENTITY`: an INSERT that writes it says `OVERRIDING SYSTEM VALUE`
+    pub identity_always: bool,
     /// Ordinal position (0-based) in the table's column list.
     pub ordinal: usize,
 }
@@ -144,8 +134,13 @@ pub fn extract_row_value(row: &tokio_postgres::Row, idx: usize, pg_type: &Type) 
             Ok(Some(v)) => RowValue::I16(v),
             _ => RowValue::Null,
         },
-        Type::INT4 | Type::OID => match row.try_get::<_, Option<i32>>(idx) {
+        Type::INT4 => match row.try_get::<_, Option<i32>>(idx) {
             Ok(Some(v)) => RowValue::I32(v),
+            _ => RowValue::Null,
+        },
+        // an OID is unsigned: past i32::MAX it fits an i64 only
+        Type::OID => match row.try_get::<_, Option<u32>>(idx) {
+            Ok(Some(v)) => RowValue::I64(v.into()),
             _ => RowValue::Null,
         },
         Type::INT8 => match row.try_get::<_, Option<i64>>(idx) {
@@ -197,19 +192,28 @@ pub fn extract_row_value(row: &tokio_postgres::Row, idx: usize, pg_type: &Type) 
             _ => RowValue::Null,
         },
         Type::NUMERIC => {
-            // Numeric types are read as string via the text representation
-            // to avoid precision loss. We query the raw text.
+            // NUMERIC is read as its exact text, which the diff's queries select
+            // (`sql_gen::select_column` casts it): no precision is lost.
             match row.try_get::<_, Option<String>>(idx) {
                 Ok(Some(v)) => RowValue::Numeric(v),
                 _ => RowValue::Null,
             }
         }
-        // Fallback: try to read as string
+        // Fallback: read as text (the diff's queries cast what it does not decode to text)
         _ => match row.try_get::<_, Option<String>>(idx) {
             Ok(Some(v)) => RowValue::Text(v),
             _ => RowValue::Null,
         },
     }
+}
+
+/// The key of a row as one string: `n` text columns from `start` (selected by `sql_gen::pk_text_list`),
+/// joined by `'|'`; a NULL one as `NULL`.
+pub fn text_key(row: &tokio_postgres::Row, start: usize, n: usize) -> String {
+    (start..start + n)
+        .map(|i| row.try_get::<_, Option<String>>(i).ok().flatten().unwrap_or_else(|| "NULL".to_string()))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Extract an entire row into a `Vec<RowValue>` given column info.
@@ -219,4 +223,24 @@ pub fn extract_row(row: &tokio_postgres::Row, columns: &[ColumnInfo]) -> Row {
         .enumerate()
         .map(|(idx, col)| extract_row_value(row, idx, &col.pg_type))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_strategy_displays_its_name_and_its_parameters() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap().and_hms_opt(0, 0, 0).unwrap();
+        assert_eq!(ChunkStrategy::IdChunkSmall.to_string(), "IdChunkSmall");
+        assert_eq!(ChunkStrategy::IdChunkMedium.to_string(), "IdChunkMedium");
+        assert_eq!(ChunkStrategy::IdChunkLargeExcluded.to_string(), "IdChunkLargeExcluded");
+        let md5 = ChunkStrategy::Md5TimestampChunk {
+            timestamp_column: "updated_at".into(),
+            min_ts: ts,
+            max_ts: ts,
+            chunk_days: 2.54,
+        };
+        assert_eq!(md5.to_string(), "Md5TimestampChunk(col=updated_at, chunk_days=2.5)");
+    }
 }

@@ -1,10 +1,11 @@
 name: coverage
 
-# [coverage] The whole `cargo test` - the unit tests and the live test together, the live
-# test (tests/cluster_live.rs) on a throwaway PostgreSQL, the service below - and its line
+# [coverage] The whole `cargo test` - the unit tests and the live tests together, the live
+# tests (tests/diff_live.rs, tests/cluster_live.rs, tests/cli.rs) on a throwaway PostgreSQL,
+# the service below, as its superuser - and its line
 # coverage over src/. The badge is our own, no third party: drawn from lcov.info and kept
-# on the `badges` branch (the last step), which the README shows. No gate yet: set
-# --fail-under-lines once this has measured its figure here.
+# on the `badges` branch (the last step), which the README shows. The gate: the run fails
+# under 90% of the lines covered (97.5% when it was set, 2026-11-11).
 on:
   push:
     branches-ignore: ["dependabot/**"]   # their pull request runs it
@@ -16,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write   # the coverage badge's push, to the badges branch
-    # the live test's server: it creates and drops its own databases there
+    # the live tests' server: they create and drop their own databases there (dd_*)
     services:
       postgres:
         image: postgres:17
@@ -38,7 +39,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov
-      - run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info
+      - run: cargo llvm-cov --no-fail-fast --lcov --output-path lcov.info --fail-under-lines 90
       # [coverage] our own badge, no third party: lcov.info's line coverage, drawn by
       # .github/coverage-badge.py and kept on the `badges` branch - one commit, replaced
       # each time - which the README shows. On a push to the default branch only: a pull

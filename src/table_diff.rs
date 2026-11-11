@@ -8,8 +8,11 @@ use tracing::debug;
 use crate::config::{parse_table_name, ProgressEvent};
 use crate::error::{DataDiffError, Result};
 use crate::metadata::{get_columns, resolve_pk_columns, table_exists};
-use crate::sql_gen::{build_check_query, format_table_name, generate_insert, generate_update, quote_identifier};
-use crate::types::{extract_row, ChunkStrategy, ColumnInfo, DiffStats, Row, RowValue, TableAnalysis, TableDiffStatus};
+use crate::sql_gen::{
+    build_check_query, format_table_name, generate_insert, generate_update, pk_text_list, quote_identifier,
+    select_list,
+};
+use crate::types::{extract_row, text_key, ChunkStrategy, ColumnInfo, DiffStats, Row, TableAnalysis, TableDiffStatus};
 
 /// Compares data between a reference and target table,
 /// generating INSERT statements for missing rows and UPDATE statements for modified rows.
@@ -27,8 +30,6 @@ pub struct TableDataDiff<'a> {
     table_where: Option<String>,
     /// Whether to include identity/auto-increment columns in generated SQL.
     include_identity_columns: Option<bool>,
-    /// Target schema to use when target table is missing.
-    target_schema: Option<String>,
     /// Analysis result from the estimation phase (determines chunk strategy).
     analysis: Option<TableAnalysis>,
     /// Progress callback.
@@ -55,7 +56,6 @@ impl<'a> TableDataDiff<'a> {
             exclude_real_pk: false,
             table_where: None,
             include_identity_columns: None,
-            target_schema: None,
             analysis: None,
             on_progress: None,
             cancelled: false,
@@ -107,10 +107,6 @@ impl<'a> TableDataDiff<'a> {
         cb: Option<std::sync::Arc<dyn Fn(ProgressEvent) + Send + Sync>>,
     ) {
         self.on_progress = cb;
-    }
-
-    pub fn set_target_schema(&mut self, schema: Option<String>) {
-        self.target_schema = schema;
     }
 
     pub fn cancel(&mut self) {
@@ -229,12 +225,7 @@ impl<'a> TableDataDiff<'a> {
 
         // Build the reference table SELECT query
         let ref_table_sql = format_table_name(&self.ref_table);
-        let select_cols: String = ref_columns
-            .iter()
-            .map(|c| quote_identifier(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut retrieve_sql = format!("SELECT {} FROM {}", select_cols, ref_table_sql);
+        let mut retrieve_sql = format!("SELECT {} FROM {}", select_list(&ref_columns), ref_table_sql);
 
         if let Some(ref where_cond) = self.table_where {
             retrieve_sql.push_str(" WHERE ");
@@ -357,6 +348,10 @@ impl<'a> TableDataDiff<'a> {
             .map(|c| quote_identifier(&c.name))
             .collect::<Vec<_>>()
             .join(", ");
+        // a row is matched across the two sides by its key as text, whatever the key's types
+        let pk_text = pk_text_list(&pk_cols);
+        let ref_columns_shared: Vec<ColumnInfo> = shared_columns.iter().map(|c| (*c).clone()).collect();
+        let shared_select = select_list(&ref_columns_shared);
 
         // Calculate number of chunks
         let total_duration = max_ts.signed_duration_since(min_ts);
@@ -374,6 +369,8 @@ impl<'a> TableDataDiff<'a> {
         let ref_table_sql = format_table_name(&self.ref_table);
         let target_table_sql = format_table_name(&self.target_table);
         let ts_col_sql = quote_identifier(&ts_col);
+        // the filter takes the reference's rows; a target row is looked at by a reference row's key only
+        let ref_filter = self.table_where.as_ref().map(|w| format!(" AND ({})", w)).unwrap_or_default();
 
         for chunk_idx in 0..num_chunks {
             if self.cancelled {
@@ -399,12 +396,14 @@ impl<'a> TableDataDiff<'a> {
 
             // Query MD5 hashes from reference
             let ref_md5_sql = format!(
-                "SELECT md5(ROW({col_list})::text), {pk_cols} FROM {table} \
-                 WHERE {ts} >= $1 AND {ts} < $2 ORDER BY {pk_cols}",
+                "SELECT md5(ROW({col_list})::text), {pk_text} FROM {table} \
+                 WHERE {ts} >= $1 AND {ts} < $2{filter} ORDER BY {pk_cols}",
                 col_list = col_list,
+                pk_text = pk_text,
                 pk_cols = pk_col_list,
                 table = ref_table_sql,
                 ts = ts_col_sql,
+                filter = ref_filter,
             );
 
             let ref_md5_rows = self
@@ -414,9 +413,10 @@ impl<'a> TableDataDiff<'a> {
 
             // Query MD5 hashes from target
             let target_md5_sql = format!(
-                "SELECT md5(ROW({col_list})::text), {pk_cols} FROM {table} \
+                "SELECT md5(ROW({col_list})::text), {pk_text} FROM {table} \
                  WHERE {ts} >= $1 AND {ts} < $2 ORDER BY {pk_cols}",
                 col_list = col_list,
+                pk_text = pk_text,
                 pk_cols = pk_col_list,
                 table = target_table_sql,
                 ts = ts_col_sql,
@@ -428,20 +428,15 @@ impl<'a> TableDataDiff<'a> {
                 .await?;
 
             // Build hash maps: pk_values_string -> md5_hash
-            let ref_hashes = build_md5_map(&ref_md5_rows, &pk_cols);
-            let target_hashes = build_md5_map(&target_md5_rows, &pk_cols);
+            let ref_hashes = build_md5_map(&ref_md5_rows, pk_cols.len());
+            let target_hashes = build_md5_map(&target_md5_rows, pk_cols.len());
 
             // Find PKs where hash differs or missing in target
-            let mut diff_pks: Vec<String> = Vec::new();
-            for (pk_key, ref_hash) in &ref_hashes {
-                match target_hashes.get(pk_key) {
-                    None => diff_pks.push(pk_key.clone()),
-                    Some(target_hash) if target_hash != ref_hash => {
-                        diff_pks.push(pk_key.clone())
-                    }
-                    _ => {}
-                }
-            }
+            let diff_pks: HashSet<&String> = ref_hashes
+                .iter()
+                .filter(|(pk_key, ref_hash)| target_hashes.get(*pk_key) != Some(*ref_hash))
+                .map(|(pk_key, _)| pk_key)
+                .collect();
 
             if diff_pks.is_empty() {
                 continue;
@@ -451,8 +446,10 @@ impl<'a> TableDataDiff<'a> {
             // We need to build WHERE clauses from the PK values
             // Re-query full rows from reference for this chunk with timestamp filter
             let ref_full_sql = format!(
-                "SELECT {cols} FROM {table} WHERE {ts} >= $1 AND {ts} < $2 ORDER BY {pk_cols}",
-                cols = col_list,
+                "SELECT {cols}, {pk_text} FROM {table} WHERE {ts} >= $1 AND {ts} < $2{filter} ORDER BY {pk_cols}",
+                filter = ref_filter,
+                cols = shared_select,
+                pk_text = pk_text,
                 table = ref_table_sql,
                 ts = ts_col_sql,
                 pk_cols = pk_col_list,
@@ -463,19 +460,11 @@ impl<'a> TableDataDiff<'a> {
                 .query(&ref_full_sql, &[&chunk_start, &chunk_end])
                 .await?;
 
-            // Filter to only rows whose PK is in diff_pks
-            let ref_columns_shared: Vec<ColumnInfo> = shared_columns.iter().map(|c| (*c).clone()).collect();
+            // Filter to only rows whose PK is in diff_pks: the key text follows the shared columns
             let diff_rows: Vec<Row> = ref_full_rows
                 .iter()
-                .filter_map(|pg_row| {
-                    let row = extract_row(pg_row, &ref_columns_shared);
-                    let pk_key = row_pk_key(&row, &ref_columns_shared, &pk_cols);
-                    if diff_pks.contains(&pk_key) {
-                        Some(row)
-                    } else {
-                        None
-                    }
-                })
+                .filter(|pg_row| diff_pks.contains(&text_key(pg_row, ref_columns_shared.len(), pk_cols.len())))
+                .map(|pg_row| extract_row(pg_row, &ref_columns_shared))
                 .collect();
 
             if !diff_rows.is_empty() {
@@ -657,11 +646,10 @@ fn find_modified_columns(
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&ref_col.name));
 
-        if let Some(target_idx) = target_idx {
-            if ref_row[ref_idx] != target_row[target_idx] {
+        if let Some(target_idx) = target_idx
+            && ref_row[ref_idx] != target_row[target_idx] {
                 modified.push(ref_idx);
             }
-        }
     }
 
     modified
@@ -683,49 +671,52 @@ fn write_header(writer: &mut impl Write, table_name: &str) -> Result<()> {
 
 /// Build a HashMap from MD5 query results: pk_key_string -> md5_hash.
 ///
-/// Each row is expected to have md5 as column 0 and PK columns starting at column 1.
-fn build_md5_map(
-    rows: &[tokio_postgres::Row],
-    pk_cols: &[ColumnInfo],
-) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for row in rows {
-        let md5: String = row.get(0);
-        let mut pk_key = String::new();
-        for (i, _pk) in pk_cols.iter().enumerate() {
-            if i > 0 {
-                pk_key.push('|');
-            }
-            // PK columns start at index 1 (index 0 is the md5 hash)
-            let val: Option<String> = row.try_get::<_, Option<String>>(i + 1).unwrap_or(None);
-            pk_key.push_str(&val.unwrap_or_else(|| "NULL".to_string()));
-        }
-        map.insert(pk_key, md5);
-    }
-    map
+/// Each row is expected to have md5 as column 0 and its `pk_len` key columns, as text, from column 1.
+fn build_md5_map(rows: &[tokio_postgres::Row], pk_len: usize) -> HashMap<String, String> {
+    rows.iter().map(|row| (text_key(row, 1, pk_len), row.get(0))).collect()
 }
 
-/// Build a string key from PK column values for lookup.
-fn row_pk_key(row: &Row, columns: &[ColumnInfo], pk_cols: &[ColumnInfo]) -> String {
-    let mut key = String::new();
-    for (i, pk) in pk_cols.iter().enumerate() {
-        if i > 0 {
-            key.push('|');
-        }
-        let idx = columns
-            .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(&pk.name))
-            .unwrap();
-        let val = &row[idx];
-        match val {
-            RowValue::Null => key.push_str("NULL"),
-            RowValue::I16(v) => key.push_str(&v.to_string()),
-            RowValue::I32(v) => key.push_str(&v.to_string()),
-            RowValue::I64(v) => key.push_str(&v.to_string()),
-            RowValue::Text(v) => key.push_str(v),
-            RowValue::Uuid(v) => key.push_str(&v.to_string()),
-            other => key.push_str(&format!("{:?}", other)),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::RowValue;
+    use postgres_types::Type;
+
+    fn col(name: &str, is_pk: bool) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), pg_type: Type::TEXT, is_pk, is_identity: false, identity_always: false, ordinal: 0 }
     }
-    key
+
+    #[test]
+    fn a_row_is_found_by_its_key_whatever_the_column_order() {
+        let ref_cols = vec![col("id", true), col("name", false)];
+        let target_cols = vec![col("NAME", false), col("extra", false), col("ID", true)];
+        let pk = vec![col("id", true)];
+        let target_rows = vec![
+            vec![RowValue::Text("a".into()), RowValue::Null, RowValue::I32(1)],
+            vec![RowValue::Text("b".into()), RowValue::Null, RowValue::I32(2)],
+        ];
+        let found = find_row_by_pk(&target_rows, &target_cols, &vec![RowValue::I32(2), RowValue::Null], &ref_cols, &pk);
+        assert_eq!(found, Some(&target_rows[1]));
+        assert_eq!(find_row_by_pk(&target_rows, &target_cols, &vec![RowValue::I32(3), RowValue::Null], &ref_cols, &pk), None);
+    }
+
+    #[test]
+    fn the_modified_columns_skip_the_ignored_and_the_ones_the_target_lacks() {
+        let ref_cols = vec![col("id", true), col("name", false), col("Seen", false), col("gone", false)];
+        let target_cols = vec![col("id", true), col("name", false), col("seen", false)];
+        let ref_row = vec![RowValue::I32(1), RowValue::Text("new".into()), RowValue::I32(5), RowValue::Null];
+        let target_row = vec![RowValue::I32(1), RowValue::Text("old".into()), RowValue::I32(4)];
+        let ignore: HashSet<String> = ["seen".to_string()].into();
+        assert_eq!(find_modified_columns(&ref_row, &target_row, &ref_cols, &target_cols, &ignore), vec![1]);
+        assert_eq!(find_modified_columns(&ref_row, &target_row, &ref_cols, &target_cols, &HashSet::new()), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_header_names_the_table_without_its_schema() {
+        let mut out = Vec::new();
+        write_header(&mut out, "public.users").unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("-- Data diff for table: users\n"));
+        assert_eq!(text.lines().count(), 3);
+    }
 }

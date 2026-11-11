@@ -8,8 +8,8 @@ use tracing::debug;
 
 use crate::config::parse_table_name;
 use crate::error::{DataDiffError, Result};
-use crate::sql_gen::{format_table_name, quote_identifier};
-use crate::types::{ChunkStrategy, ColumnInfo, TableAnalysis};
+use crate::sql_gen::{format_table_name, pk_text_list, quote_identifier};
+use crate::types::{text_key, ChunkStrategy, ColumnInfo, TableAnalysis};
 
 /// Checksum data for a single table chunk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -49,7 +49,9 @@ pub struct TableDiffSummary {
     pub modified: Vec<String>,
 }
 
-/// Compute MD5 checksums for all chunks of a single table.
+/// Compute MD5 checksums for all chunks of a single table, each row's keyed by its key as text.
+///
+/// A table without a key has no row to key a checksum by: `NoPrimaryKey`.
 pub async fn compute_table_checksums(
     client: &Client,
     table_name: &str,
@@ -57,6 +59,9 @@ pub async fn compute_table_checksums(
     pk_cols: &[ColumnInfo],
     analysis: &TableAnalysis,
 ) -> Result<TableChecksum> {
+    if pk_cols.is_empty() {
+        return Err(DataDiffError::NoPrimaryKey(table_name.to_string()));
+    }
     let table_sql = format_table_name(table_name);
     let col_list: String = columns
         .iter()
@@ -68,6 +73,7 @@ pub async fn compute_table_checksums(
         .map(|c| quote_identifier(&c.name))
         .collect::<Vec<_>>()
         .join(", ");
+    let pk_text = pk_text_list(pk_cols);
 
     let chunks = match &analysis.strategy {
         ChunkStrategy::Md5TimestampChunk {
@@ -97,9 +103,10 @@ pub async fn compute_table_checksums(
                 };
 
                 let sql = format!(
-                    "SELECT md5(ROW({col_list})::text), {pk_cols} FROM {table} \
+                    "SELECT md5(ROW({col_list})::text), {pk_text} FROM {table} \
                      WHERE {ts} >= $1 AND {ts} < $2 ORDER BY {pk_cols}",
                     col_list = col_list,
+                    pk_text = pk_text,
                     pk_cols = pk_col_list,
                     table = table_sql,
                     ts = ts_col_sql,
@@ -126,8 +133,9 @@ pub async fn compute_table_checksums(
         _ => {
             // For IdChunkSmall/Medium/LargeExcluded: single chunk with all rows
             let sql = format!(
-                "SELECT md5(ROW({col_list})::text), {pk_cols} FROM {table} ORDER BY {pk_cols}",
+                "SELECT md5(ROW({col_list})::text), {pk_text} FROM {table} ORDER BY {pk_cols}",
                 col_list = col_list,
+                pk_text = pk_text,
                 pk_cols = pk_col_list,
                 table = table_sql,
             );
@@ -161,7 +169,8 @@ pub async fn compute_table_checksums(
     })
 }
 
-/// Compute checksums for all tables in a database.
+/// Compute checksums for all tables in a database. A table without a key stops it (`NoPrimaryKey`):
+/// leave those out, as `DataDiff` does.
 pub async fn compute_db_checksums(
     client: &Client,
     tables: &[(String, Vec<ColumnInfo>, Vec<ColumnInfo>)],
@@ -199,7 +208,7 @@ pub fn save_checksums(manifest: &ChecksumManifest, path: &Path) -> Result<()> {
 /// Deserialize a checksum manifest from a YAML file.
 pub fn load_checksums(path: &Path) -> Result<ChecksumManifest> {
     let file = std::fs::File::open(path).map_err(|e| {
-        DataDiffError::Checksum(format!("Failed to open checksum file {}: {}", path.display(), e))
+        DataDiffError::Checksum(tr!("error.checksum_open", path = path.display(), err = e))
     })?;
     let manifest: ChecksumManifest = serde_yaml::from_reader(file)?;
     debug!("Loaded checksums from {}", path.display());
@@ -325,17 +334,9 @@ pub fn compare_checksums(
     summaries
 }
 
-/// Extract a PK key string from a tokio_postgres::Row where PK columns start at index 1.
+/// Extract a PK key string from a tokio_postgres::Row whose PK columns, as text, start at index 1.
 fn extract_pk_key_from_row(row: &tokio_postgres::Row, pk_cols: &[ColumnInfo]) -> String {
-    let mut pk_key = String::new();
-    for (i, _pk) in pk_cols.iter().enumerate() {
-        if i > 0 {
-            pk_key.push('|');
-        }
-        let val: Option<String> = row.try_get::<_, Option<String>>(i + 1).unwrap_or(None);
-        pk_key.push_str(&val.unwrap_or_else(|| "NULL".to_string()));
-    }
-    pk_key
+    text_key(row, 1, pk_cols.len())
 }
 
 #[cfg(test)]
@@ -457,5 +458,79 @@ mod tests {
 
         let summaries = compare_checksums(&manifest, &manifest);
         assert!(summaries.is_empty());
+    }
+
+    fn chunk(index: usize, rows: &[(&str, &str)]) -> ChunkChecksum {
+        ChunkChecksum {
+            chunk_index: index,
+            chunk_start: String::new(),
+            chunk_end: String::new(),
+            row_hashes: rows.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    fn manifest(tables: Vec<(&str, Vec<ChunkChecksum>)>) -> ChecksumManifest {
+        ChecksumManifest {
+            db_name: None,
+            schema: None,
+            created_at: String::new(),
+            tables: tables
+                .into_iter()
+                .map(|(name, chunks)| TableChecksum {
+                    table_name: name.to_string(),
+                    strategy: "Md5TimestampChunk".to_string(),
+                    row_count: 0,
+                    timestamp_column: Some("updated_at".to_string()),
+                    chunks,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_table_or_a_chunk_on_one_side_only_differs_whole() {
+        let reference = manifest(vec![
+            ("gone", vec![chunk(0, &[("1", "a")]), chunk(1, &[("2", "b")])]),
+            ("events", vec![chunk(0, &[("1", "a")]), chunk(1, &[("2", "b")])]),
+        ]);
+        let target = manifest(vec![("events", vec![chunk(0, &[("1", "a")]), chunk(2, &[("3", "c")])])]);
+        let mut summaries = compare_checksums(&reference, &target);
+        summaries.sort_by(|a, b| a.table_name.cmp(&b.table_name));
+        assert_eq!(summaries.len(), 2);
+
+        let events = &summaries[0];
+        assert_eq!(events.table_name, "events");
+        assert_eq!(events.differing_chunks, vec![1, 2]);
+        assert_eq!(events.missing_in_target, vec!["2"]);
+        assert_eq!(events.missing_in_reference, vec!["3"]);
+        assert!(events.modified.is_empty());
+
+        let gone = &summaries[1];
+        assert_eq!(gone.differing_chunks, vec![0, 1]);
+        let mut missing = gone.missing_in_target.clone();
+        missing.sort();
+        assert_eq!(missing, vec!["1", "2"]);
+    }
+
+    #[test]
+    fn a_manifest_is_saved_and_loaded_back_and_a_bad_file_refused() {
+        let dir = std::env::temp_dir().join(format!("diff_data_checksum_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ref.yaml");
+        let saved = manifest(vec![("events", vec![chunk(0, &[("1", "a")])])]);
+        save_checksums(&saved, &path).unwrap();
+        let loaded = load_checksums(&path).unwrap();
+        assert_eq!(loaded.tables[0].table_name, "events");
+        assert_eq!(loaded.tables[0].chunks[0].row_hashes["1"], "a");
+
+        match load_checksums(&dir.join("missing.yaml")) {
+            Err(DataDiffError::Checksum(msg)) => assert!(msg.starts_with("DA-E017 "), "{}", msg),
+            other => panic!("{:?}", other),
+        }
+        let bad = dir.join("bad.yaml");
+        std::fs::write(&bad, "tables: [").unwrap();
+        assert!(matches!(load_checksums(&bad), Err(DataDiffError::Yaml(_))));
+        assert!(save_checksums(&saved, &dir.join("no/such/dir.yaml")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

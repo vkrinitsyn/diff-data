@@ -86,3 +86,54 @@ async fn a_node_is_made_the_same_as_its_primary() {
         admin.batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)")).await.unwrap();
     }
 }
+
+/// What the reads report and decide at their edges: the server's error with its detail and hint (and a
+/// client-side error as itself), the first key's type, no ranges, empty tables, a single-column key's leaf
+#[tokio::test]
+async fn the_reads_report_the_servers_error_and_decide_at_their_edges() {
+    let Ok(base) = std::env::var("DIFF_DATA_PG") else { return };
+    let admin = connect(&base, "postgres").await;
+    for db in ["dd_edges_primary", "dd_edges_node"] {
+        admin.batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)")).await.unwrap();
+        admin.batch_execute(&format!("CREATE DATABASE {db}")).await.unwrap();
+    }
+    let p = connect(&base, "dd_edges_primary").await;
+    let n = connect(&base, "dd_edges_node").await;
+
+    let err = diff::apply(&n, "DO $$ BEGIN RAISE EXCEPTION 'boom' USING DETAIL = 'the detail', HINT = 'the hint'; END $$")
+        .await.unwrap_err();
+    assert_eq!(err, "[P0001] boom | detail: the detail | hint: the hint");
+    let client_side = n.query("SELECT $1::int", &[]).await.unwrap_err();
+    assert_eq!(diff::pg_text(&client_side), client_side.to_string());
+    // as a diff_data error: its code, then what the server said
+    diff_data::i18n::set_lang("en");
+    let server_side = n.query("SELECT 1/0", &[]).await.unwrap_err();
+    let e = diff_data::DataDiffError::from(server_side);
+    assert_eq!(e.to_string(), "DA-E001 PostgreSQL error: [22012] division by zero");
+    assert!(std::error::Error::source(&e).is_some());
+
+    for c in [&p, &n] {
+        c.batch_execute("CREATE TABLE public.one (id int PRIMARY KEY, v text); CREATE TABLE public.named (k text PRIMARY KEY)")
+            .await.unwrap();
+    }
+    let rules = TableRules::default();
+    let one = diff::shape_of(&p, "public", "one", &rules).await.unwrap();
+    let named = diff::shape_of(&p, "public", "named", &rules).await.unwrap();
+    assert!(diff::first_key_is_integer(&p, "public", "one", &one).await.unwrap());
+    assert!(!diff::first_key_is_integer(&p, "public", "named", &named).await.unwrap());
+    assert!(diff::range_folds(&p, "public", "one", &one, &[]).await.unwrap().is_empty());
+    assert_eq!(diff::key_bounds(&p, "public", "one", &one).await.unwrap(), None);
+    assert!(diff::ranged_plan(&p, &n, "public", "one", &one, 2).await.unwrap().is_empty(), "no rows on either side");
+
+    // a single-column key: its leaves are read whole, never paged
+    p.batch_execute("INSERT INTO public.one SELECT g, 'v' || g FROM generate_series(1, 9) g").await.unwrap();
+    n.batch_execute("INSERT INTO public.one SELECT g, 'v' || g FROM generate_series(2, 9) g; \
+        UPDATE public.one SET v = 'changed' WHERE id = 8; INSERT INTO public.one VALUES (20, 'extra')").await.unwrap();
+    let plan = diff::ranged_plan(&p, &n, "public", "one", &one, 2).await.unwrap();
+    assert_eq!((plan.upsert.clone(), plan.delete.clone()), (vec!["1".to_string(), "8".to_string()], vec!["20".to_string()]));
+
+    drop((p, n));
+    for db in ["dd_edges_primary", "dd_edges_node"] {
+        admin.batch_execute(&format!("DROP DATABASE IF EXISTS {db} WITH (FORCE)")).await.unwrap();
+    }
+}

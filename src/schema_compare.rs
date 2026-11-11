@@ -137,3 +137,70 @@ pub async fn compare_all_schemas(
 
     Ok(results)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use schema_guard_tokio::loader::PgColumnDfn;
+
+    fn table(cols: &[(&str, &str)]) -> PgTable {
+        PgTable {
+            table_name: "t".into(),
+            columns: cols
+                .iter()
+                .enumerate()
+                .map(|(i, (n, ty))| {
+                    (n.to_string(), PgColumnDfn {
+                        column_name: n.to_string(),
+                        column_type: ty.to_string(),
+                        column_default: None,
+                        sql: None,
+                        fk: None,
+                        pk: i == 0,
+                        nullable: true,
+                        sort_order: i,
+                        column_comment: None,
+                    })
+                })
+                .collect(),
+            fks: HashMap::new(),
+            triggers: HashMap::new(),
+            indexes: HashMap::new(),
+            grants: HashMap::new(),
+            primary_key: None,
+            sort_order: 0,
+            table_comment: None,
+            owner: None,
+        }
+    }
+
+    #[test]
+    fn a_target_matches_has_more_or_mismatches() {
+        let base = table(&[("id", "int4"), ("name", "text")]);
+        assert!(matches!(compare_table_schema(&base, &base, false), SchemaComparisonResult::Match));
+
+        let wider = table(&[("id", "int4"), ("name", "text"), ("extra", "int8")]);
+        match compare_table_schema(&base, &wider, false) {
+            SchemaComparisonResult::TargetSuperset { extra_columns } => assert_eq!(extra_columns, vec!["extra"]),
+            other => panic!("{:?}", other),
+        }
+
+        let narrower = table(&[("id", "int4")]);
+        match compare_table_schema(&base, &narrower, false) {
+            SchemaComparisonResult::Mismatch { message } => {
+                assert_eq!(message, "Reference columns missing in target: name")
+            }
+            other => panic!("{:?}", other),
+        }
+        assert!(matches!(compare_table_schema(&base, &narrower, true), SchemaComparisonResult::Excluded));
+
+        let retyped = table(&[("id", "int8"), ("name", "text")]);
+        match compare_table_schema(&base, &retyped, false) {
+            SchemaComparisonResult::Mismatch { message } => {
+                assert_eq!(message, "Type mismatches: column 'id': type 'int4' vs 'int8'")
+            }
+            other => panic!("{:?}", other),
+        }
+        assert!(matches!(compare_table_schema(&base, &retyped, true), SchemaComparisonResult::Excluded));
+    }
+}

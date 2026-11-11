@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use postgres_types::Type;
 use tokio_postgres::Client;
@@ -59,7 +59,7 @@ pub async fn get_columns(
     let col_rows = client
         .query(
             "SELECT column_name, udt_name, ordinal_position, is_identity, \
-             column_default \
+             column_default, identity_generation \
              FROM information_schema.columns \
              WHERE table_schema = $1 AND table_name = $2 \
              ORDER BY ordinal_position",
@@ -97,6 +97,7 @@ pub async fn get_columns(
             let udt_name: String = row.get("udt_name");
             let is_identity_str: String = row.get("is_identity");
             let col_default: Option<String> = row.get("column_default");
+            let identity_generation: Option<String> = row.get("identity_generation");
 
             let is_pk = pk_names.iter().any(|pk| pk.eq_ignore_ascii_case(&name));
             let is_identity = is_identity_str == "YES"
@@ -110,6 +111,7 @@ pub async fn get_columns(
                 pg_type: resolve_pg_type(&udt_name),
                 is_pk,
                 is_identity,
+                identity_always: identity_generation.as_deref() == Some("ALWAYS"),
                 ordinal: idx,
             }
         })
@@ -188,8 +190,7 @@ pub async fn get_fk_dependencies(
         .collect())
 }
 
-/// Sort tables for INSERT order: parents before children (topological sort).
-/// Tables without FK dependencies come first.
+/// Sort tables for INSERT order: parents before children (topological sort), else in the order given.
 pub fn sort_for_insert(tables: &[String], deps: &[FkDependency]) -> Vec<String> {
     topological_sort(tables, deps, false)
 }
@@ -199,77 +200,53 @@ pub fn sort_for_delete(tables: &[String], deps: &[FkDependency]) -> Vec<String> 
     topological_sort(tables, deps, true)
 }
 
-/// Topological sort using Kahn's algorithm.
-/// If `reverse` is true, returns delete order (children first).
+/// Topological sort using Kahn's algorithm, stable: of the tables ready, the first given goes first.
+/// Tables in a dependency cycle follow, in the order given. Names compare case-insensitively; a name
+/// given twice is listed once. If `reverse` is true, returns delete order (children first).
 fn topological_sort(tables: &[String], deps: &[FkDependency], reverse: bool) -> Vec<String> {
-    let table_set: HashSet<String> = tables.iter().map(|t| t.to_lowercase()).collect();
-
-    // Build adjacency list: parent -> children (for insert order)
-    let mut in_degree: HashMap<String, usize> = HashMap::new();
-    let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
-
-    for t in &table_set {
-        in_degree.entry(t.clone()).or_insert(0);
-        adjacency.entry(t.clone()).or_default();
-    }
-
-    for dep in deps {
-        let child = dep.table.to_lowercase();
-        let parent = dep.references_table.to_lowercase();
-
-        if !table_set.contains(&child) || !table_set.contains(&parent) {
-            continue;
+    let mut names: Vec<String> = Vec::new();
+    for t in tables {
+        if !names.iter().any(|n| n.eq_ignore_ascii_case(t)) {
+            names.push(t.clone());
         }
+    }
+    let index: HashMap<String, usize> = names.iter().enumerate().map(|(i, t)| (t.to_lowercase(), i)).collect();
 
-        // parent -> child edge: child depends on parent
-        adjacency.entry(parent.clone()).or_default().push(child.clone());
-        *in_degree.entry(child).or_insert(0) += 1;
+    // parent -> children; a child's count of parents not yet placed
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
+    let mut in_degree = vec![0usize; names.len()];
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
+    for dep in deps {
+        let (Some(&child), Some(&parent)) =
+            (index.get(&dep.table.to_lowercase()), index.get(&dep.references_table.to_lowercase()))
+        else {
+            continue;
+        };
+        if child != parent && edges.insert((parent, child)) {
+            children[parent].push(child);
+            in_degree[child] += 1;
+        }
     }
 
-    // Kahn's algorithm
-    let mut queue: Vec<String> = in_degree
-        .iter()
-        .filter(|&(_, deg)| *deg == 0)
-        .map(|(t, _)| t.clone())
-        .collect();
-    queue.sort(); // deterministic order
-
-    let mut result = Vec::new();
-
-    while let Some(node) = queue.pop() {
-        result.push(node.clone());
-        if let Some(children) = adjacency.get(&node) {
-            for child in children {
-                if let Some(deg) = in_degree.get_mut(child) {
-                    *deg -= 1;
-                    if *deg == 0 {
-                        queue.push(child.clone());
-                        queue.sort();
-                    }
-                }
+    let mut ready: BTreeSet<usize> = (0..names.len()).filter(|&i| in_degree[i] == 0).collect();
+    let mut order: Vec<usize> = Vec::with_capacity(names.len());
+    while let Some(i) = ready.pop_first() {
+        order.push(i);
+        for &c in &children[i] {
+            in_degree[c] -= 1;
+            if in_degree[c] == 0 {
+                ready.insert(c);
             }
         }
     }
+    // a cycle: its tables at the end, in the order given
+    let rest: Vec<usize> = (0..names.len()).filter(|i| !order.contains(i)).collect();
+    order.extend(rest);
 
-    // Add any remaining tables (circular dependencies) at the end
-    for t in &table_set {
-        if !result.contains(t) {
-            result.push(t.clone());
-        }
-    }
-
-    // Map back to original casing
-    let mut ordered: Vec<String> = Vec::with_capacity(result.len());
-    for sorted_name in &result {
-        if let Some(original) = tables.iter().find(|t| t.eq_ignore_ascii_case(sorted_name)) {
-            ordered.push(original.clone());
-        }
-    }
-
+    let mut ordered: Vec<String> = order.into_iter().map(|i| names[i].clone()).collect();
     if reverse {
         ordered.reverse();
     }
-
     ordered
 }
 
@@ -285,8 +262,8 @@ pub fn resolve_pk_columns(
         .map(|c| c.name.clone())
         .collect();
 
-    if let Some(alt_keys) = alternate_keys {
-        if !alt_keys.is_empty() {
+    if let Some(alt_keys) = alternate_keys
+        && !alt_keys.is_empty() {
             let pk_cols: Vec<ColumnInfo> = columns
                 .iter()
                 .filter(|c| {
@@ -298,8 +275,93 @@ pub fn resolve_pk_columns(
                 .collect();
             return (pk_cols, real_pk);
         }
-    }
 
     let pk_cols: Vec<ColumnInfo> = columns.iter().filter(|c| c.is_pk).cloned().collect();
     (pk_cols, real_pk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn col(name: &str, is_pk: bool) -> ColumnInfo {
+        ColumnInfo { name: name.to_string(), pg_type: Type::TEXT, is_pk, is_identity: false, identity_always: false, ordinal: 0 }
+    }
+
+    fn dep(table: &str, references_table: &str) -> FkDependency {
+        FkDependency { table: table.to_string(), references_table: references_table.to_string() }
+    }
+
+    #[test]
+    fn a_type_name_resolves_to_its_postgres_type() {
+        let cases = [
+            ("bool", Type::BOOL), ("boolean", Type::BOOL),
+            ("int2", Type::INT2), ("smallint", Type::INT2),
+            ("int4", Type::INT4), ("integer", Type::INT4), ("int", Type::INT4), ("serial", Type::INT4),
+            ("int8", Type::INT8), ("bigint", Type::INT8), ("bigserial", Type::INT8),
+            ("float4", Type::FLOAT4), ("real", Type::FLOAT4),
+            ("float8", Type::FLOAT8), ("double precision", Type::FLOAT8),
+            ("numeric", Type::NUMERIC), ("decimal", Type::NUMERIC),
+            ("text", Type::TEXT),
+            ("varchar", Type::VARCHAR), ("character varying", Type::VARCHAR),
+            ("char", Type::BPCHAR), ("character", Type::BPCHAR), ("bpchar", Type::BPCHAR),
+            ("bytea", Type::BYTEA),
+            ("timestamp", Type::TIMESTAMP), ("timestamp without time zone", Type::TIMESTAMP),
+            ("timestamptz", Type::TIMESTAMPTZ), ("timestamp with time zone", Type::TIMESTAMPTZ),
+            ("date", Type::DATE),
+            ("time", Type::TIME), ("time without time zone", Type::TIME),
+            ("uuid", Type::UUID), ("json", Type::JSON), ("jsonb", Type::JSONB),
+            ("oid", Type::OID), ("name", Type::NAME),
+            ("_int4", Type::TEXT), ("interval", Type::TEXT),
+        ];
+        for (name, expected) in cases {
+            assert_eq!(resolve_pg_type(name), expected, "{}", name);
+        }
+    }
+
+    #[test]
+    fn parents_are_inserted_before_children_and_deleted_after() {
+        let tables: Vec<String> = ["Orders", "customers", "order_items", "audit"].iter().map(|s| s.to_string()).collect();
+        let deps = vec![
+            dep("orders", "customers"),
+            dep("order_items", "Orders"),
+            // a dependency on a table outside the set is left out
+            dep("audit", "elsewhere"),
+        ];
+        let insert = sort_for_insert(&tables, &deps);
+        let pos = |v: &[String], t: &str| v.iter().position(|x| x == t).unwrap();
+        assert_eq!(insert.len(), 4);
+        assert!(pos(&insert, "customers") < pos(&insert, "Orders"));
+        assert!(pos(&insert, "Orders") < pos(&insert, "order_items"));
+
+        let delete = sort_for_delete(&tables, &deps);
+        assert!(pos(&delete, "order_items") < pos(&delete, "Orders"));
+        assert!(pos(&delete, "Orders") < pos(&delete, "customers"));
+    }
+
+    #[test]
+    fn a_dependency_cycle_still_lists_every_table() {
+        let tables: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let deps = vec![dep("a", "b"), dep("b", "a")];
+        let sorted = sort_for_insert(&tables, &deps);
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0], "c");
+        assert!(sorted.contains(&"a".to_string()) && sorted.contains(&"b".to_string()));
+    }
+
+    #[test]
+    fn the_key_is_the_alternate_one_when_given_else_the_real_one() {
+        let cols = vec![col("id", true), col("Code", false), col("name", false)];
+        let (pk, real) = resolve_pk_columns(&cols, None);
+        assert_eq!(pk.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id"]);
+        assert_eq!(real, vec!["id"]);
+
+        let alt = vec!["code".to_string()];
+        let (pk, real) = resolve_pk_columns(&cols, Some(&alt));
+        assert_eq!(pk.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["Code"]);
+        assert_eq!(real, vec!["id"]);
+
+        let (pk, _) = resolve_pk_columns(&cols, Some(&[]));
+        assert_eq!(pk.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), vec!["id"]);
+    }
 }
