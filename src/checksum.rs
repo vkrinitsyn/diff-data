@@ -199,10 +199,26 @@ pub async fn compute_db_checksums(
 
 /// Serialize a checksum manifest to a YAML file.
 pub fn save_checksums(manifest: &ChecksumManifest, path: &Path) -> Result<()> {
-    let file = std::fs::File::create(path)?;
-    serde_yaml::to_writer(file, manifest)?;
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    serde_saphyr::to_io_writer(&mut file, manifest)?;
+    std::io::Write::flush(&mut file)?;
     debug!("Saved checksums to {}", path.display());
     Ok(())
+}
+
+/// [yaml] How a checksum file is read: a manifest holds a hash per row, so serde-saphyr's default limits
+/// (250,000 nodes, a million events, 256 MB) would refuse a table of some 125,000 rows that serde_yaml
+/// (0.4.0) wrote and read. The file is the operator's own: no limit on its size, the nesting and the
+/// alias limits kept (0.4.1, 2026-11-11)
+fn read_options() -> serde_saphyr::Options {
+    let mut budget = serde_saphyr::Budget::default();
+    budget.max_reader_input_bytes = None;
+    budget.max_events = usize::MAX;
+    budget.max_nodes = usize::MAX;
+    budget.max_total_scalar_bytes = usize::MAX;
+    let mut options = serde_saphyr::Options::default();
+    options.budget = Some(budget);
+    options
 }
 
 /// Deserialize a checksum manifest from a YAML file.
@@ -210,7 +226,7 @@ pub fn load_checksums(path: &Path) -> Result<ChecksumManifest> {
     let file = std::fs::File::open(path).map_err(|e| {
         DataDiffError::Checksum(tr!("error.checksum_open", path = path.display(), err = e))
     })?;
-    let manifest: ChecksumManifest = serde_yaml::from_reader(file)?;
+    let manifest: ChecksumManifest = serde_saphyr::from_reader_with_options(std::io::BufReader::new(file), read_options())?;
     debug!("Loaded checksums from {}", path.display());
     Ok(manifest)
 }
@@ -366,8 +382,8 @@ mod tests {
             }],
         };
 
-        let yaml = serde_yaml::to_string(&manifest).unwrap();
-        let deserialized: ChecksumManifest = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_saphyr::to_string(&manifest).unwrap();
+        let deserialized: ChecksumManifest = serde_saphyr::from_str(&yaml).unwrap();
 
         assert_eq!(deserialized.db_name, manifest.db_name);
         assert_eq!(deserialized.schema, manifest.schema);
@@ -531,6 +547,76 @@ mod tests {
         std::fs::write(&bad, "tables: [").unwrap();
         assert!(matches!(load_checksums(&bad), Err(DataDiffError::Yaml(_))));
         assert!(save_checksums(&saved, &dir.join("no/such/dir.yaml")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [yaml] a checksum file as 0.4.0 (serde_yaml) wrote it - its quoted keys and values, `null`, `''`
+    /// and unquoted timestamps - read by 0.4.1 (serde-saphyr) as it was meant (2026-11-11)
+    const MANIFEST_0_4_0: &str = r#"db_name: shop
+schema: null
+created_at: 2026-11-11T19:00:00+00:00
+tables:
+- table_name: public.orders
+  strategy: IdChunkSmall
+  row_count: 3
+  timestamp_column: null
+  chunks:
+  - chunk_index: 0
+    chunk_start: ''
+    chunk_end: ''
+    row_hashes:
+      '1': 0cc175b9c0f1b6a831c399e269772661
+- table_name: public.events
+  strategy: Md5TimestampChunked
+  row_count: 0
+  timestamp_column: updated_at
+  chunks:
+  - chunk_index: 2
+    chunk_start: 2026-11-01 00:00:00+00
+    chunk_end: 2026-11-02 00:00:00+00
+    row_hashes:
+      '007': 'true'
+"#;
+
+    #[test]
+    fn a_checksum_file_0_4_0_wrote_loads_in_0_4_1() {
+        let dir = std::env::temp_dir().join(format!("diff_data_checksum_040_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("ref.yaml");
+        std::fs::write(&path, MANIFEST_0_4_0).unwrap();
+        let m = load_checksums(&path).unwrap();
+        assert_eq!((m.db_name.as_deref(), m.schema.as_deref()), (Some("shop"), None));
+        assert_eq!(m.created_at, "2026-11-11T19:00:00+00:00", "a timestamp is read as the text it is");
+        assert_eq!(m.tables.len(), 2);
+        let (o, e) = (&m.tables[0], &m.tables[1]);
+        assert_eq!((o.table_name.as_str(), o.strategy.as_str(), o.row_count, o.timestamp_column.as_deref()),
+            ("public.orders", "IdChunkSmall", 3, None));
+        assert_eq!((o.chunks[0].chunk_start.as_str(), o.chunks[0].chunk_end.as_str()), ("", ""));
+        assert_eq!(o.chunks[0].row_hashes["1"], "0cc175b9c0f1b6a831c399e269772661", "a key '1' stays the text 1");
+        assert_eq!(e.timestamp_column.as_deref(), Some("updated_at"));
+        assert_eq!((e.chunks[0].chunk_index, e.chunks[0].chunk_start.as_str()), (2, "2026-11-01 00:00:00+00"));
+        assert_eq!(e.chunks[0].row_hashes["007"], "true", "'007' and 'true' stay texts");
+        // and 0.4.1 writes what it reads back the same
+        save_checksums(&m, &path).unwrap();
+        let again = load_checksums(&path).unwrap();
+        assert_eq!(serde_saphyr::to_string(&again).unwrap(), serde_saphyr::to_string(&m).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [yaml] a checksum file over serde-saphyr's default limits (250,000 nodes): a table of 200,000 rows
+    /// loads, as it did with serde_yaml (2026-11-11)
+    #[test]
+    fn a_checksum_file_of_200_000_rows_loads() {
+        let dir = std::env::temp_dir().join(format!("diff_data_checksum_big_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.yaml");
+        let rows: Vec<(String, String)> = (0..200_000).map(|i| (i.to_string(), format!("{:032x}", i))).collect();
+        let pairs: Vec<(&str, &str)> = rows.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let saved = manifest(vec![("events", vec![chunk(0, &pairs)])]);
+        save_checksums(&saved, &path).unwrap();
+        let loaded = load_checksums(&path).unwrap();
+        assert_eq!(loaded.tables[0].chunks[0].row_hashes.len(), 200_000);
+        assert_eq!(loaded.tables[0].chunks[0].row_hashes["199999"], format!("{:032x}", 199_999));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -66,9 +66,8 @@ mod tests {
             let f = f.unwrap().path();
             let lang = f.file_stem().unwrap().to_str().unwrap().to_string();
             files.push(lang.clone());
-            let y: serde_yaml::Mapping = serde_yaml::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
+            let y: BTreeMap<String, serde_json::Value> = serde_saphyr::from_str(&std::fs::read_to_string(&f).unwrap()).unwrap();
             for (k, v) in y {
-                let k = k.as_str().unwrap().to_string();
                 if k == "_version" {
                     assert_eq!(v.as_u64(), Some(1), "{}: a file per language", f.display());
                     continue;

@@ -18,7 +18,9 @@ pub enum DataDiffError {
     Config(String),
     /// a checksum file that cannot be read: its message
     Checksum(String),
-    Yaml(serde_yaml::Error),
+    /// a checksum file that is not the YAML of a manifest, or a manifest that cannot be written: the
+    /// YAML library's error (serde-saphyr's since 0.4.1, its read and its write error)
+    Yaml(Box<dyn std::error::Error + Send + Sync>),
 }
 
 impl fmt::Display for DataDiffError {
@@ -46,7 +48,7 @@ impl std::error::Error for DataDiffError {
             DataDiffError::Postgres(e) => Some(e),
             DataDiffError::Io(e) => Some(e),
             DataDiffError::Pool(e) => Some(e),
-            DataDiffError::Yaml(e) => Some(e),
+            DataDiffError::Yaml(e) => Some(e.as_ref()),
             _ => None,
         }
     }
@@ -70,9 +72,15 @@ impl From<bb8::RunError<tokio_postgres::Error>> for DataDiffError {
     }
 }
 
-impl From<serde_yaml::Error> for DataDiffError {
-    fn from(e: serde_yaml::Error) -> Self {
-        DataDiffError::Yaml(e)
+impl From<serde_saphyr::Error> for DataDiffError {
+    fn from(e: serde_saphyr::Error) -> Self {
+        DataDiffError::Yaml(Box::new(e))
+    }
+}
+
+impl From<serde_saphyr::SerializeError> for DataDiffError {
+    fn from(e: serde_saphyr::SerializeError) -> Self {
+        DataDiffError::Yaml(Box::new(e))
     }
 }
 
@@ -98,7 +106,7 @@ mod tests {
         let io: DataDiffError = io::Error::new(io::ErrorKind::NotFound, "gone").into();
         assert_eq!(io.to_string(), "DA-E002 I/O error: gone");
         assert!(io.source().is_some());
-        let yaml: DataDiffError = serde_yaml::from_str::<Vec<u8>>("{").unwrap_err().into();
+        let yaml: DataDiffError = serde_saphyr::from_str::<Vec<u8>>("{").unwrap_err().into();
         assert!(yaml.to_string().starts_with("DA-E008 ") && yaml.source().is_some());
         let pool: DataDiffError = bb8::RunError::<tokio_postgres::Error>::TimedOut.into();
         assert!(pool.to_string().starts_with("DA-E003 ") && pool.source().is_some());
